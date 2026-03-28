@@ -385,6 +385,29 @@ const server = http.createServer(async (req, res) => {
       return send(res, { ok: true, news });
     }
 
+    // ── AI ASK endpoint — proxies Anthropic for dashboard stock briefs ──
+    if (pathname === '/api/ask' && req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', async () => {
+        try {
+          const { prompt, system, max_tokens = 1000 } = JSON.parse(body);
+          const Anthropic = require('@anthropic-ai/sdk');
+          const client = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+          const msg = await client.messages.create({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens,
+            system: system || 'You are a helpful investment analyst.',
+            messages: [{ role: 'user', content: prompt }],
+          });
+          send(res, { ok: true, text: msg.content?.[0]?.text || '' });
+        } catch(e) {
+          send(res, { ok: false, error: e.message }, 500);
+        }
+      });
+      return;
+    }
+
     send(res, { error: 'Not found', endpoints: ['/health','/api/snapshot','/api/opportunities','/api/portfolio','/api/stats','/api/calibration','/api/refresh','/api/preferences','/webhook/telegram'] }, 404);
 
   } catch (e) {
