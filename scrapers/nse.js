@@ -123,6 +123,13 @@ async function getNifty500List() {
 }
 
 // ── PRICE HISTORY (52 weeks) for sigma calculation ────────────
+
+function getDateString(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().slice(0, 10);
+}
+
 async function getPriceHistory(symbol, fromDate, toDate) {
   const from = fromDate || getDateString(-365); // 1 year back
   const to   = toDate   || getDateString(0);    // today

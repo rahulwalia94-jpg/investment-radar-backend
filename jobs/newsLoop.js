@@ -333,47 +333,32 @@ async function fetchNewsBatch(symbols) {
 
 // ── SAVE NEWS BATCH TO FIREBASE ───────────────────────────────
 async function saveNewsBatch(results) {
-  if (Object.keys(results).length === 0) return;
-
-  // Save each stock's news to Firebase
-  // Using merge so we don't overwrite other stocks
-  const db      = fb.init();
-  const batch   = db.batch();
-  const now     = new Date().toISOString();
-
-  Object.entries(results).forEach(([symbol, items]) => {
-    const ref = db.collection('news').doc('stocks').collection('by_symbol').doc(symbol);
-    batch.set(ref, {
-      symbol,
-      items,
-      fetched_at: now,
-      count:      items.length,
+  try {
+    // Load existing news, merge, save back to B2
+    const existing = await db.getLatestNews() || { stocks: {}, market: [], updated_at: null };
+    
+    results.forEach(r => {
+      if (!r || !r.symbol) return;
+      if (!existing.stocks) existing.stocks = {};
+      existing.stocks[r.symbol] = {
+        items:      (r.items || []).slice(0, 10),
+        sentiment:  r.sentiment,
+        updated_at: new Date().toISOString(),
+      };
     });
-  });
-
-  await batch.commit();
-
-  // Also update the consolidated news index
-  // (used by scoring engine to quickly check which stocks have news)
-  const indexRef = db.collection('news').doc('stock_index');
-  const updates  = {};
-  Object.entries(results).forEach(([symbol, items]) => {
-    updates[symbol] = {
-      has_news:   true,
-      count:      items.length,
-      latest:     items[0]?.title?.slice(0, 80) || '',
-      fetched_at: now,
-    };
-  });
-
-  await indexRef.set(updates, { merge: true });
+    
+    existing.updated_at = new Date().toISOString();
+    await db.saveNews(existing);
+  } catch(e) {
+    console.error('saveNewsBatch error:', e.message);
+  }
 }
 
 // ── GET NEWS FOR STOCK (used by scoring engine) ───────────────
 async function getStockNews(symbol) {
   try {
-    const db  = fb.init();
-    const doc = await db.collection('news').doc('stocks').collection('by_symbol').doc(symbol).get();
+      const newsData = await db.getLatestNews() || {};
+    const doc = { exists: !!(newsData.stocks?.[symbol]), data: () => newsData.stocks?.[symbol] || {} };
     return doc.exists ? doc.data() : null;
   } catch (e) {
     return null;
@@ -383,15 +368,15 @@ async function getStockNews(symbol) {
 // ── GET NEWS FOR MULTIPLE STOCKS ──────────────────────────────
 async function getStockNewsMultiple(symbols) {
   try {
-    const db      = fb.init();
-    const results = {};
+      const results = {};
 
     // Batch get — Firestore allows 10 at a time
     const batchSize = 10;
     for (let i = 0; i < symbols.length; i += batchSize) {
       const batch = symbols.slice(i, i + batchSize);
       await Promise.all(batch.map(async (symbol) => {
-        const doc = await db.collection('news').doc('stocks').collection('by_symbol').doc(symbol).get();
+        const newsData = await db.getLatestNews() || {};
+    const doc = { exists: !!(newsData.stocks?.[symbol]), data: () => newsData.stocks?.[symbol] || {} };
         if (doc.exists) results[symbol] = doc.data().items || [];
       }));
     }
@@ -406,8 +391,8 @@ async function getStockNewsMultiple(symbols) {
 // ── GET ALL RECENT NEWS (for market summary) ──────────────────
 async function getMarketNews() {
   try {
-    const db  = fb.init();
-    const doc = await db.collection('news').doc('market').get();
+      const newsData2 = await db.getLatestNews() || {};
+  const doc = { exists: !!(newsData2.market), data: () => ({ items: newsData2.market || [] }) };
     return doc.exists ? doc.data().items || [] : [];
   } catch (e) {
     return [];
@@ -442,12 +427,8 @@ async function fetchMarketNews() {
   }).slice(0, 20);
 
   // Save to Firebase
-  const db = fb.init();
-  await db.collection('news').doc('market').set({
-    items:      dedup,
-    fetched_at: new Date().toISOString(),
-    count:      dedup.length,
-  });
+  const existing2 = await db.getLatestNews() || {};
+  await db.saveNews({ ...existing2, market: dedup, market_updated_at: new Date().toISOString() });
 
   return dedup;
 }

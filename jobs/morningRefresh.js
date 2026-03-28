@@ -107,7 +107,7 @@ async function runMorningRefresh() {
   snap.dividends= cal.dividends;
 
   // 8. Yahoo macro + ALL US prices (105 stocks)
-  const { US_UNIVERSE, getYahooSymbol, getAllUSSymbols } = require('../../shared/us_instruments');
+  const { US_UNIVERSE, getYahooSymbol, getAllUSSymbols } = require('../shared/us_instruments');
   const macro     = await nse.getMacro();
   const allUSSyms = getAllUSSymbols().map(getYahooSymbol);
   const usPrices  = await nse.getAllUSPrices(allUSSyms);
