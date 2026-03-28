@@ -288,7 +288,7 @@ async function runWeeklyRecalibration() {
 
   // ── 5. Add ALL US stocks with real price history ─────────────
   console.log('\n[5/6] Calibrating all US stocks from Yahoo price history...');
-  const { US_UNIVERSE, getAllUSSymbols, getYahooSymbol } = require('../../shared/us_instruments');
+  const { US_UNIVERSE, getAllUSSymbols, getYahooSymbol } = require('../shared/us_instruments');
 
   const usInstruments = {};
   const allUSSymbols  = getAllUSSymbols();

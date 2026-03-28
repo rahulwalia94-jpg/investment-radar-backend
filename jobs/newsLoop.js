@@ -335,18 +335,28 @@ async function fetchNewsBatch(symbols) {
 // ── SAVE NEWS BATCH TO FIREBASE ───────────────────────────────
 async function saveNewsBatch(results) {
   try {
-    // Load existing news, merge, save back to B2
     const existing = await db.getLatestNews() || { stocks: {}, market: [], updated_at: null };
+    if (!existing.stocks) existing.stocks = {};
     
-    results.forEach(r => {
-      if (!r || !r.symbol) return;
-      if (!existing.stocks) existing.stocks = {};
-      existing.stocks[r.symbol] = {
-        items:      (r.items || []).slice(0, 10),
-        sentiment:  r.sentiment,
-        updated_at: new Date().toISOString(),
-      };
-    });
+    // results can be object {symbol: data} or array [{symbol, items}]
+    if (Array.isArray(results)) {
+      results.forEach(r => {
+        if (!r || !r.symbol) return;
+        existing.stocks[r.symbol] = {
+          items:      (r.items || []).slice(0, 10),
+          sentiment:  r.sentiment,
+          updated_at: new Date().toISOString(),
+        };
+      });
+    } else {
+      Object.entries(results).forEach(([sym, data]) => {
+        existing.stocks[sym] = {
+          items:      (data.items || []).slice(0, 10),
+          sentiment:  data.sentiment,
+          updated_at: new Date().toISOString(),
+        };
+      });
+    }
     
     existing.updated_at = new Date().toISOString();
     await db.saveNews(existing);
