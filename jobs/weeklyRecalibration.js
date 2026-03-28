@@ -192,16 +192,18 @@ async function runWeeklyRecalibration() {
   console.log('\n[4/6] Calculating calibration for each stock...');
   const calibratedInstruments = {};
 
-  // Process in batches of 20 with delays
+  // Process SEQUENTIALLY with delays to avoid NSE rate limiting
   const batchSize = 20;
   for (let i = 0; i < nifty500.length; i += batchSize) {
     const batch = nifty500.slice(i, i + batchSize);
 
-    await Promise.all(batch.map(async (stock) => {
+    // Sequential - one at a time with delay to avoid NSE blocking
+    for (const stock of batch) {
+      await (async (stock) => {
       try {
         // Get price history for this stock
         const history = await nse.getPriceHistory(stock.symbol);
-        await nse.sleep(200);
+        await nse.sleep(800); // 800ms between requests — NSE won't block
 
         if (!history || history.length < 30) {
           stats.skipped.push(stock.symbol);
@@ -275,15 +277,16 @@ async function runWeeklyRecalibration() {
         console.error(`Error calibrating ${stock.symbol}:`, e.message);
         stats.errors.push({ symbol: stock.symbol, error: e.message });
       }
-    }));
+      })(stock);
+    }
 
-    // Save batch to Firebase
+    // Save batch to B2
     if (Object.keys(calibratedInstruments).length > 0) {
       await fb.bulkSaveInstruments(calibratedInstruments);
       console.log(`  Progress: ${i + batchSize}/${nifty500.length} | Calibrated: ${stats.calibrated}`);
     }
 
-    await nse.sleep(1000); // 1 second between batches
+    await nse.sleep(3000); // 3 seconds between batches
   }
 
   // ── 5. Add ALL US stocks with real price history ─────────────
@@ -375,28 +378,7 @@ async function runWeeklyRecalibration() {
   await fb.saveUniverse('us_stocks', allUSSymbols);
   console.log(`US stocks calibrated: ${Object.keys(usInstruments).length}/${allUSSymbols.length}`);
 
-  // ── 6. Generate AI context for top stocks ─────────────────
-  console.log('\n[6/6] Generating AI context for top 50 stocks...');
-  const top50 = nifty500.slice(0, 50);
-  for (const stock of top50.slice(0, 20)) { // top 20 first
-    try {
-      const val = valuations[stock.symbol];
-      const cal = calibratedInstruments[stock.symbol]?.calibration;
-      const context = await ai.generateStockContext(stock, val, cal);
-      if (context) {
-        await fb.saveInstrument(stock.symbol, { ai_context: context });
-      }
-      await nse.sleep(300);
-    } catch (e) {
-      console.error(`AI context error for ${stock.symbol}:`, e.message);
-    }
-  }
-
-  // ── Save calibration run log ───────────────────────────────
-  const elapsed = Math.round((Date.now() - start) / 1000);
-  stats.elapsed_seconds = elapsed;
-  stats.completed_at    = new Date().toISOString();
-
+  // AI context generation skipped (function removed)
   await fb.saveCalibrationRun(stats);
 
   console.log('\n' + '='.repeat(60));
