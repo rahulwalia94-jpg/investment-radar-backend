@@ -500,6 +500,25 @@ async function getMacro() {
     }
   });
 
+  // Direct fallback for USD/INR if Yahoo failed
+  if (!result.usdInr) {
+    try {
+      const usdInrData = await new Promise(resolve => {
+        https.get({
+          hostname: 'open.er-api.com',
+          path:     '/v6/latest/USD',
+          headers:  { 'User-Agent': 'Mozilla/5.0' },
+          timeout:  8000,
+        }, res => {
+          let d = ''; res.on('data', c => d += c); res.on('end', () => {
+            try { resolve(JSON.parse(d)); } catch { resolve(null); }
+          });
+        }).on('error', () => resolve(null)).on('timeout', function() { this.destroy(); resolve(null); });
+      });
+      if (usdInrData?.rates?.INR) result.usdInr = usdInrData.rates.INR;
+    } catch(e) {}
+  }
+
   // Alpha Vantage fallback for missing priority symbols
   const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'KB3U5RNE551GUQUR';
   const PRIORITY = ['NET','CEG','GLNG'];
