@@ -7,6 +7,7 @@
 const https = require('https');
 const zlib  = require('zlib');
 const fb    = require('../db');
+const db    = fb;  // alias for B2 db
 
 // ── GOOGLE NEWS QUERIES ───────────────────────────────────────
 // Maps stock symbol → best search query for that stock
