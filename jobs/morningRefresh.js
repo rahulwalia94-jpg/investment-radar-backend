@@ -161,6 +161,8 @@ async function runMorningRefresh() {
   // 11. Save snapshot
   await fb.saveSnapshot(snap);
 
+  let scores = {}; // initialized here, populated by Python engine or Haiku fallback
+
   // 12. Run Python Quant Engine (GARCH + DCC + Factor Model + Monte Carlo)
   console.log('Running Python quant engine...');
   const prefs = await fb.getPreferences();
@@ -245,6 +247,7 @@ async function runMiddayUpdate() {
 
   // Threshold alerts
   const latestAnalysis = await fb.getLatestAIAnalysis();
+  const alerts = latestAnalysis?.alerts || [];
   for (const alert of alerts) {
     if (alert.type === 'PRICE_MOVE' && prefs.phone) {
       const pos = prefs.portfolio?.[alert.stock];
