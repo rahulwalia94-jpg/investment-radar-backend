@@ -14,7 +14,7 @@ function sleep(ms) {
 function fetchScreenerPage(symbol) {
   return new Promise(resolve => {
     // Try consolidated first, then standalone
-    const path = `/company/${symbol}/consolidated/`;
+    const path = `/company/${encodeURIComponent(symbol)}/consolidated/`;
     const req = https.get({
       hostname: 'www.screener.in',
       path,
@@ -124,7 +124,7 @@ async function getValuation(symbol) {
       const r2 = await new Promise(resolve => {
         const req = https.get({
           hostname: 'www.screener.in',
-          path:     `/company/${symbol}/`,
+          path:     `/company/${encodeURIComponent(symbol)}/`,
           headers:  { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' },
           timeout:  10000,
         }, res => {
@@ -186,11 +186,11 @@ async function getHistoricalPE(symbol) {
     const r = await new Promise(resolve => {
       const req = https.get({
         hostname: 'www.screener.in',
-        path:     `/api/company/${symbol}/?format=json`,
+        path:     `/api/company/${encodeURIComponent(symbol)}/?format=json`,
         headers:  {
           'User-Agent': 'Mozilla/5.0',
           'Accept':     'application/json',
-          'Referer':    `https://www.screener.in/company/${symbol}/`,
+          'Referer':    `https://www.screener.in/company/${encodeURIComponent(symbol)}/`,
         },
         timeout: 10000,
       }, res => {
