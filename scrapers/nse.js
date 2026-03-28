@@ -122,7 +122,7 @@ async function getNifty500List() {
   return stocks;
 }
 
-// ── PRICE HISTORY (52 weeks) for sigma calculation ────────────
+// ── PRICE HISTORY via Yahoo Finance (NSE historical API blocks cloud IPs) ──
 
 function getDateString(offsetDays = 0) {
   const d = new Date();
@@ -131,21 +131,59 @@ function getDateString(offsetDays = 0) {
 }
 
 async function getPriceHistory(symbol, fromDate, toDate) {
-  const from = fromDate || getDateString(-365); // 1 year back
-  const to   = toDate   || getDateString(0);    // today
-  const path = `/api/historical/cm/equity?symbol=${encodeURIComponent(symbol)}&series=["EQ"]&from=${from}&to=${to}`;
-  const r = await fetchNSE(path);
-  if (!r.ok) return null;
-
-  const rows = r.data?.data || [];
-  return rows.map(d => ({
-    date:  d.CH_TIMESTAMP || d.mTIMESTAMP,
-    close: parseFloat(d.CH_CLOSING_PRICE || d.VWAP || 0),
-    open:  parseFloat(d.CH_OPENING_PRICE || 0),
-    high:  parseFloat(d.CH_TRADE_HIGH_PRICE || 0),
-    low:   parseFloat(d.CH_TRADE_LOW_PRICE || 0),
-    vol:   parseInt(d.CH_TOT_TRADED_QTY || 0),
-  })).filter(d => d.close > 0);
+  // Yahoo Finance: append .NS for NSE stocks
+  const yahooSymbol = symbol.includes('.') ? symbol : `${symbol}.NS`;
+  
+  const toTs   = Math.floor(Date.now() / 1000);
+  const fromTs = toTs - (365 * 24 * 3600); // 1 year back
+  
+  return new Promise((resolve) => {
+    const https   = require('https');
+    const options = {
+      hostname: 'query1.finance.yahoo.com',
+      path:     `/v8/finance/chart/${yahooSymbol}?interval=1d&period1=${fromTs}&period2=${toTs}`,
+      method:   'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept':     'application/json',
+      },
+      timeout: 15000,
+    };
+    
+    const req = https.request(options, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const data       = JSON.parse(Buffer.concat(chunks).toString());
+          const result     = data?.chart?.result?.[0];
+          if (!result) { resolve(null); return; }
+          
+          const timestamps = result.timestamp || [];
+          const quotes     = result.indicators?.quote?.[0] || {};
+          const closes     = quotes.close  || [];
+          const highs      = quotes.high   || [];
+          const lows       = quotes.low    || [];
+          const volumes    = quotes.volume || [];
+          
+          const history = timestamps.map((ts, i) => ({
+            date:  new Date(ts * 1000).toISOString().slice(0, 10),
+            close: closes[i]  ? parseFloat(closes[i].toFixed(2))  : 0,
+            high:  highs[i]   ? parseFloat(highs[i].toFixed(2))   : 0,
+            low:   lows[i]    ? parseFloat(lows[i].toFixed(2))    : 0,
+            vol:   volumes[i] || 0,
+          })).filter(d => d.close > 0);
+          
+          resolve(history.length >= 30 ? history : null);
+        } catch(e) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
 }
 
 // ── CURRENT QUOTE (single stock) ─────────────────────────────
