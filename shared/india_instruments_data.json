@@ -1,0 +1,189 @@
+{
+  "GOLDBEES": {
+    "name": "Nippon India Gold ETF",
+    "sector": "Gold ETF",
+    "asset_class": "COMMODITY",
+    "country": "IN"
+  },
+  "SILVERBEES": {
+    "name": "Nippon India Silver ETF",
+    "sector": "Silver ETF",
+    "asset_class": "COMMODITY",
+    "country": "IN"
+  },
+  "GILT5YBEES": {
+    "name": "Nippon India ETF Gilt 2030",
+    "sector": "Govt Bond ETF",
+    "asset_class": "BOND",
+    "duration_yrs": 5,
+    "yield_pct": 7.1,
+    "credit": "SOVEREIGN",
+    "country": "IN"
+  },
+  "GSEC10YEAR": {
+    "name": "ICICI Prudential Gilt ETF",
+    "sector": "Govt Bond ETF",
+    "asset_class": "BOND",
+    "duration_yrs": 10,
+    "yield_pct": 7.2,
+    "credit": "SOVEREIGN",
+    "country": "IN"
+  },
+  "LTGILTBEES": {
+    "name": "SBI ETF 10 Year Gilt",
+    "sector": "Govt Bond ETF",
+    "asset_class": "BOND",
+    "duration_yrs": 10,
+    "yield_pct": 7.2,
+    "credit": "SOVEREIGN",
+    "country": "IN"
+  },
+  "CPSEETF": {
+    "name": "Bharat Bond ETF Apr 2031",
+    "sector": "PSU Bond ETF",
+    "asset_class": "BOND",
+    "duration_yrs": 7,
+    "yield_pct": 7.5,
+    "credit": "AAA_PSU",
+    "country": "IN"
+  },
+  "LIQUIDBEES": {
+    "name": "Nippon India ETF Liquid BeES",
+    "sector": "Liquid Fund ETF",
+    "asset_class": "LIQUID",
+    "yield_pct": 6.5,
+    "country": "IN"
+  },
+  "ABSLARB": {
+    "name": "Aditya Birla SL Arbitrage Fund",
+    "sector": "Arbitrage Fund",
+    "asset_class": "ARBITRAGE",
+    "expected_return_pct": 7.2,
+    "country": "IN"
+  },
+  "HDFCARB": {
+    "name": "HDFC Arbitrage Fund",
+    "sector": "Arbitrage Fund",
+    "asset_class": "ARBITRAGE",
+    "expected_return_pct": 7.1,
+    "country": "IN"
+  },
+  "KOTAKARB": {
+    "name": "Kotak Arbitrage Fund",
+    "sector": "Arbitrage Fund",
+    "asset_class": "ARBITRAGE",
+    "expected_return_pct": 7.0,
+    "country": "IN"
+  },
+  "NIPARB": {
+    "name": "Nippon India Arbitrage Fund",
+    "sector": "Arbitrage Fund",
+    "asset_class": "ARBITRAGE",
+    "expected_return_pct": 7.2,
+    "country": "IN"
+  },
+  "ICICIARB": {
+    "name": "ICICI Prudential Arbitrage Fund",
+    "sector": "Arbitrage Fund",
+    "asset_class": "ARBITRAGE",
+    "expected_return_pct": 7.1,
+    "country": "IN"
+  },
+  "EMBASSY": {
+    "name": "Embassy Office Parks REIT",
+    "sector": "Office REIT",
+    "asset_class": "REIT",
+    "yield_pct": 6.2,
+    "noi_growth_pct": 8,
+    "country": "IN"
+  },
+  "MINDSPACE": {
+    "name": "Mindspace Business Parks REIT",
+    "sector": "Office REIT",
+    "asset_class": "REIT",
+    "yield_pct": 6.5,
+    "noi_growth_pct": 7,
+    "country": "IN"
+  },
+  "BROOKFIELD": {
+    "name": "Brookfield India REIT",
+    "sector": "Office REIT",
+    "asset_class": "REIT",
+    "yield_pct": 7.1,
+    "noi_growth_pct": 9,
+    "country": "IN"
+  },
+  "NEXUSMALLS": {
+    "name": "Nexus Select Trust REIT",
+    "sector": "Retail REIT",
+    "asset_class": "REIT",
+    "yield_pct": 5.8,
+    "noi_growth_pct": 10,
+    "country": "IN"
+  },
+  "INDIGRID": {
+    "name": "IndiGrid InvIT",
+    "sector": "Power Transmission InvIT",
+    "asset_class": "INVIT",
+    "yield_pct": 8.5,
+    "country": "IN"
+  },
+  "POWERGRIDINV": {
+    "name": "PowerGrid InvIT",
+    "sector": "Power Transmission InvIT",
+    "asset_class": "INVIT",
+    "yield_pct": 8.2,
+    "country": "IN"
+  },
+  "NHAI": {
+    "name": "NHAI InvIT",
+    "sector": "Roads InvIT",
+    "asset_class": "INVIT",
+    "yield_pct": 8.0,
+    "country": "IN"
+  },
+  "IRBINVIT": {
+    "name": "IRB InvIT Fund",
+    "sector": "Roads InvIT",
+    "asset_class": "INVIT",
+    "yield_pct": 8.8,
+    "country": "IN"
+  },
+  "STRLINFRA": {
+    "name": "Sterlite Power InvIT",
+    "sector": "Power Transmission InvIT",
+    "asset_class": "INVIT",
+    "yield_pct": 9.2,
+    "country": "IN"
+  },
+  "MON100": {
+    "name": "Motilal Oswal Nasdaq 100 ETF",
+    "sector": "US Tech ETF",
+    "asset_class": "INTERNATIONAL_ETF",
+    "country": "IN"
+  },
+  "MAFANG": {
+    "name": "Mirae Asset NYSE FANG+ ETF",
+    "sector": "US Tech ETF",
+    "asset_class": "INTERNATIONAL_ETF",
+    "country": "IN"
+  },
+  "JUNIORBEES": {
+    "name": "Nippon India ETF Junior BeES",
+    "sector": "Midcap ETF",
+    "asset_class": "DOMESTIC_ETF",
+    "country": "IN"
+  },
+  "MOM100": {
+    "name": "Nifty Momentum 100 ETF",
+    "sector": "Factor ETF",
+    "asset_class": "DOMESTIC_ETF",
+    "country": "IN"
+  },
+  "LOWVOL1": {
+    "name": "ICICI Pru Nifty Low Vol 30 ETF",
+    "sector": "Factor ETF",
+    "asset_class": "DOMESTIC_ETF",
+    "country": "IN"
+  }
+}
