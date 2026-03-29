@@ -22,7 +22,7 @@ from monteCarlo import simulate_portfolio, kelly_fraction, calc_targets
 from backtester import run_backtest
 from correlations import build_portfolio_correlation
 
-import anthropic
+import requests as _req
 import sqlite3
 import urllib.request
 import base64
@@ -30,6 +30,31 @@ import json as _json
 
 
 # ── BACKBLAZE B2: PRICE HISTORY ──────────────────────────────
+def _claude(api_key, system, user, max_tokens=1000):
+    """Call Anthropic API directly via HTTP — no SDK dependency."""
+    try:
+        r = _req.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': 'claude-haiku-4-5-20251001',
+                'max_tokens': max_tokens,
+                'system': system,
+                'messages': [{'role': 'user', 'content': user}],
+            },
+            timeout=30,
+        )
+        data = r.json()
+        return data.get('content', [{}])[0].get('text', '')
+    except Exception as e:
+        print(f"Claude API error: {e}")
+        return ''
+
+
 def download_price_history():
     """Download price_history.db from Backblaze B2 to /tmp"""
     try:
@@ -395,7 +420,7 @@ def run_full_backtest(instruments: dict, snap: dict) -> dict:
 def generate_narrative(snap: dict, all_scores: dict,
                         portfolio_analytics: dict) -> dict:
     print("Generating narratives with Claude Sonnet...")
-    client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+    _api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
     regime  = snap.get('regime', 'SIDEWAYS')
     fii     = (snap.get('fii') or {}).get('fii_net', 0)
@@ -440,12 +465,8 @@ Write 4 sections:
 Under 200 words total. Precise. No fluff."""
 
     try:
-        response = client.messages.create(
-            model      = 'claude-sonnet-4-5',
-            max_tokens = 500,
-            messages   = [{'role': 'user', 'content': prompt}]
-        )
-        narrative = response.content[0].text
+        _resp_text = _claude(_api_key, "", prompt, 500)
+        narrative = _resp_text
     except Exception as e:
         narrative = f"Regime: {regime}. FII {round(fii)} Cr. VIX {vix}. Top picks: {top10_str[:100]}"
 
@@ -458,12 +479,8 @@ Return ONLY JSON (no markdown):
 {{"chains":[{{"trigger":"...","mechanism":"...","severity":4,"positive":[{{"stock":"HAL","adj":3,"reason":"..."}}],"negative":[{{"stock":"INDIGO","adj":-4,"reason":"..."}}]}}]}}"""
 
     try:
-        chains_resp = client.messages.create(
-            model      = 'claude-sonnet-4-5',
-            max_tokens = 600,
-            messages   = [{'role': 'user', 'content': chains_prompt}]
-        )
-        chains_text = chains_resp.content[0].text.replace('```json','').replace('```','').strip()
+        _resp_text = _claude(_api_key, "", chains_prompt, 600)
+        chains_text = _resp_text.replace('```json','').replace('```','').strip()
         chains = json.loads(chains_text)
     except:
         chains = {'chains': []}
@@ -477,12 +494,8 @@ Kelly sizing: NET {round(net_k*100,1)}%, CEG {round(ceg_k*100,1)}%, GLNG {round(
 {{"NET":{{"action":"HOLD","reason":"...","stop_loss":175,"target":265,"kelly_pct":{round(net_k*100,1)}}},"CEG":{{"action":"HOLD","reason":"...","stop_loss":270,"target":380,"kelly_pct":{round(ceg_k*100,1)}}},"GLNG":{{"action":"ADD","reason":"...","stop_loss":42,"target":68,"kelly_pct":{round(glng_k*100,1)}}},"coherence":"...","weekly_outlook":"..."}}"""
 
     try:
-        port_resp = client.messages.create(
-            model      = 'claude-sonnet-4-5',
-            max_tokens = 400,
-            messages   = [{'role': 'user', 'content': port_prompt}]
-        )
-        port_text   = port_resp.content[0].text.replace('```json','').replace('```','').strip()
+        _resp_text = _claude(_api_key, "", port_prompt, 400)
+        port_text   = _resp_text.replace('```json','').replace('```','').strip()
         port_signal = json.loads(port_text)
     except:
         port_signal = {}
