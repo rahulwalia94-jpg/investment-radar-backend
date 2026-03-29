@@ -51,11 +51,19 @@ MARKET CONDITIONS:
 - User holds NET (Cloudflare), CEG (nuclear power), GLNG (LNG — Iran direct play)
 
 REGIME SCORING GUIDE for ${regime}:
-- DEFENSIVE sectors score higher: pharma, FMCG, gold, IT exporters (USD earners)
-- AVOID in this regime: rate-sensitives, real estate, consumer discretionary, aviation
-- FII ${fii < 0 ? 'SELLING — momentum is negative for beta stocks' : 'BUYING — momentum supports quality growth'}
-- Oil $${brent}: ${brent > 95 ? 'HIGH — good for energy/defence, BAD for aviation/auto/paints' : 'MODERATE — neutral impact'}
-- USD/INR ${usdInr}: good for IT exporters, pharma exporters, gold ETFs`;
+INDIA BEAR WINNERS: defence (HAL/BEL), pharma (SUNPHARMA/DRREDDY), FMCG (HUL/ITC), gold ETFs, IT exporters (USD earners)
+INDIA BEAR LOSERS: realty, NBFCs, consumer discretionary, aviation, small caps
+FII ${fii < 0 ? 'SELLING — negative momentum for high-beta stocks' : 'BUYING — supports quality'}
+Oil $${brent}: ${brent > 95 ? 'HIGH — bullish for ONGC/energy, bearish for aviation/auto/paints' : 'MODERATE'}
+USD/INR ${usdInr}: strong USD = good for IT exporters, pharma, gold
+
+US STOCK BEAR REGIME NUANCE — do NOT just give gold high scores:
+DEFENSIVE US (score 65-80 even in BEAR): CEG (nuclear baseload power, regulated, non-cyclical), NET (cybersecurity — spending doesn't stop in recessions), PLTR (defence contracts), LMT/RTX/NOC (defence — govt spending), JNJ/UNH/LLY (healthcare), WMT/COST (defensive retail), GLD/GDX (gold hedge)
+MODERATE US (score 45-65 in BEAR): XOM/CVX (energy — depends on oil), MSFT/GOOGL/AAPL (large cap quality, resilient but not immune), V/MA (payments — volume drops in recession)
+AVOID IN BEAR (score 25-45): TSLA (high beta EV), META/SNAP (ad spend collapses), ARKK (speculative), small growth stocks, SOXX (semi cyclical)
+NET specifically: cybersecurity is counter-cyclical in recessions — security budgets are last to be cut. Score NET 60-75 in BEAR.
+CEG specifically: nuclear baseload power, regulated utility economics, scores 65-80 in BEAR.
+GLNG specifically: LNG shipping — Iran risk is BULLISH for LNG prices and GLNG revenue. Score 65-75 in BEAR.`;
 
   // ── GROUP INSTRUMENTS BY SECTOR ───────────────────────────
   // Score each sector independently — no cross-sector positional bias

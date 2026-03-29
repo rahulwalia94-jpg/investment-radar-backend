@@ -205,6 +205,11 @@ async function runWeeklyRecalibration() {
         const history = await nse.getPriceHistory(stock.symbol);
         await nse.sleep(800); // 800ms between requests — NSE won't block
 
+        // Debug: log first 3 stocks to see what Yahoo returns
+        if (stats.calibrated + stats.skipped.length < 3) {
+          console.log(`  DEBUG ${stock.symbol}: history=${history ? history.length + ' rows' : 'NULL'}`);
+        }
+
         if (!history || history.length < 30) {
           stats.skipped.push(stock.symbol);
           // Save basic data even without calibration
