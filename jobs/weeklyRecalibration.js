@@ -1,402 +1,340 @@
-// ═══════════════════════════════════════════════════════════════
-// Weekly Recalibration Job — Phase 3
-// Runs every Sunday 2:00 AM IST
-// 1. Fetches full Nifty 500 list from NSE
-// 2. Gets 52-week price history for each stock
-// 3. Calculates REAL sigma (volatility) from actual returns
-// 4. Calculates REAL base returns per regime from historical data
-// 5. Fetches live P/E, P/B, ROE from Screener.in
-// 6. Stores everything in Firebase — no hardcoding
-// ═══════════════════════════════════════════════════════════════
-const nse      = require('../scrapers/nse');
-const screener = require('../scrapers/screener');
-const fb       = require('../db');
-const ai       = require('../ai');
-const storage  = require('../storage');
+// ── WEEKLY RECALIBRATION ───────────────────────────────────────
+// Fetches price history via Stooq (works from cloud IPs)
+// Incremental: only 14 days if data exists, else 365 days
+// Stores price history in Backblaze B2
 
-// ── REGIME CLASSIFIER ─────────────────────────────────────────
-// Classify each week in the past year as a regime based on
-// VIX + Nifty 50 moving average + FII trend
-// This lets us calculate actual returns per regime
-function classifyRegimes(niftyHistory) {
-  if (!niftyHistory || niftyHistory.length < 20) return [];
+'use strict';
 
-  const prices   = niftyHistory.map(d => d.close);
-  const classified = [];
+const fb      = require('../db');
+const stooq   = require('../scrapers/stooq');
+const nse     = require('../scrapers/nse');
+const screener= require('../scrapers/screener');
+const { US_UNIVERSE } = require('../shared/us_instruments');
 
-  for (let i = 20; i < prices.length; i++) {
-    const window   = prices.slice(i - 20, i);
-    const sma20    = window.reduce((a, b) => a + b, 0) / window.length;
-    const price    = prices[i];
-    const momentum = (price - prices[i - 10]) / prices[i - 10] * 100;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    // Calculate recent volatility (proxy for VIX)
-    const returns  = window.slice(1).map((p, j) => Math.log(p / window[j]));
-    const variance = returns.reduce((s, r) => s + r * r, 0) / returns.length;
-    const vol      = Math.sqrt(variance * 252) * 100;
+// ── REGIME CLASSIFICATION ─────────────────────────────────────
+function classifyRegimePeriods(niftyHistory) {
+  if (!niftyHistory || niftyHistory.length < 60) return {};
 
-    let regime;
-    if (price > sma20 * 1.03 && momentum > 3 && vol < 18)        regime = 'BULL';
-    else if (price > sma20 * 1.01 && momentum > 0)                regime = 'SOFT_BULL';
-    else if (price < sma20 * 0.97 && momentum < -3 && vol > 22)   regime = 'BEAR';
-    else if (price < sma20 * 0.99 && momentum < 0)                regime = 'SOFT_BEAR';
-    else                                                            regime = 'SIDEWAYS';
+  const periods = {};
+  const closes  = niftyHistory.map(d => d.close);
+  const N       = closes.length;
 
-    classified.push({ date: niftyHistory[i].date, regime, price, sma20, vol, momentum });
+  for (let i = 20; i < N; i++) {
+    const date     = niftyHistory[i].date;
+    const ma20     = closes.slice(i-20, i).reduce((s,v)=>s+v,0)/20;
+    const ma50     = i>=50 ? closes.slice(i-50,i).reduce((s,v)=>s+v,0)/50 : ma20;
+    const price    = closes[i];
+    const pct20d   = (price - closes[i-20]) / closes[i-20] * 100;
+
+    if      (price > ma20*1.03 && ma20 > ma50*1.01) periods[date] = 'BULL';
+    else if (price > ma20*1.01)                      periods[date] = 'SOFT_BULL';
+    else if (price > ma20*0.97)                      periods[date] = 'SIDEWAYS';
+    else if (price > ma20*0.94)                      periods[date] = 'SOFT_BEAR';
+    else                                             periods[date] = 'BEAR';
   }
 
-  return classified;
+  const dist = {};
+  Object.values(periods).forEach(r => { dist[r] = (dist[r]||0)+1; });
+  console.log(`Regime periods classified: ${Object.keys(periods).length} days`);
+  console.log(`Regime distribution: ${JSON.stringify(dist)}`);
+
+  return periods;
 }
 
-// ── CALCULATE SIGMA (volatility per regime) ───────────────────
-function calculateSigma(priceHistory, regimePeriods) {
-  if (!priceHistory || priceHistory.length < 10) {
-    return { BULL: 0.30, SOFT_BULL: 0.25, SIDEWAYS: 0.20, SOFT_BEAR: 0.28, BEAR: 0.40 };
-  }
-
-  // Build date → regime map
-  const regimeMap = {};
-  regimePeriods.forEach(r => { regimeMap[r.date] = r.regime; });
-
-  // Calculate daily log returns
-  const returnsByRegime = { BULL: [], SOFT_BULL: [], SIDEWAYS: [], SOFT_BEAR: [], BEAR: [] };
-
-  for (let i = 1; i < priceHistory.length; i++) {
-    const prev   = priceHistory[i - 1].close;
-    const curr   = priceHistory[i].close;
-    if (!prev || !curr) continue;
-    const ret    = Math.log(curr / prev);
-    const date   = priceHistory[i].date;
-    const regime = regimeMap[date] || 'SIDEWAYS';
-    if (returnsByRegime[regime]) returnsByRegime[regime].push(ret);
-  }
-
-  const sigma = {};
-  Object.entries(returnsByRegime).forEach(([regime, returns]) => {
-    if (returns.length < 5) {
-      sigma[regime] = regime === 'BEAR' ? 0.40 : regime === 'BULL' ? 0.28 : 0.22;
-      return;
-    }
-    const variance = returns.reduce((s, r) => s + r * r, 0) / returns.length;
-    sigma[regime]  = parseFloat(Math.sqrt(variance * 252).toFixed(3));
-  });
-
-  return sigma;
-}
-
-// ── CALCULATE BASE RETURNS per regime ─────────────────────────
-function calculateBaseReturns(priceHistory, regimePeriods) {
-  if (!priceHistory || priceHistory.length < 20) {
-    return { BULL: 25, SOFT_BULL: 12, SIDEWAYS: 5, SOFT_BEAR: -5, BEAR: -15 };
-  }
-
-  // Map dates to prices
-  const priceMap = {};
-  priceHistory.forEach(d => { priceMap[d.date] = d.close; });
-
-  // Group consecutive same-regime periods and calculate returns
-  const regimeReturns = { BULL: [], SOFT_BULL: [], SIDEWAYS: [], SOFT_BEAR: [], BEAR: [] };
-
-  if (regimePeriods.length < 10) return { BULL: 25, SOFT_BULL: 12, SIDEWAYS: 5, SOFT_BEAR: -5, BEAR: -15 };
-
-  // Find regime runs (consecutive same-regime periods)
-  let currentRegime = regimePeriods[0].regime;
-  let startIdx      = 0;
-
-  for (let i = 1; i <= regimePeriods.length; i++) {
-    const atEnd = i === regimePeriods.length;
-    if (atEnd || regimePeriods[i].regime !== currentRegime) {
-      // Regime period ended — calculate return
-      const startPrice = priceMap[regimePeriods[startIdx].date];
-      const endPrice   = priceMap[regimePeriods[i - 1].date];
-      const days       = i - startIdx;
-
-      if (startPrice && endPrice && days >= 10) {
-        // Annualize the return
-        const totalReturn   = (endPrice - startPrice) / startPrice;
-        const annualized    = totalReturn * (252 / days) * 100;
-        // Cap at reasonable bounds
-        const capped = Math.max(-60, Math.min(150, annualized));
-        regimeReturns[currentRegime].push(capped);
-      }
-
-      if (!atEnd) {
-        currentRegime = regimePeriods[i].regime;
-        startIdx      = i;
-      }
-    }
-  }
-
-  // Average the returns per regime
-  const baseReturns = {};
-  Object.entries(regimeReturns).forEach(([regime, returns]) => {
-    if (returns.length === 0) {
-      // Fallback if no data for this regime
-      const fallbacks = { BULL: 25, SOFT_BULL: 12, SIDEWAYS: 5, SOFT_BEAR: -5, BEAR: -15 };
-      baseReturns[regime] = fallbacks[regime];
-    } else {
-      const avg = returns.reduce((a, b) => a + b, 0) / returns.length;
-      baseReturns[regime] = parseFloat(avg.toFixed(1));
-    }
-  });
-
-  return baseReturns;
-}
-
-// ── MAIN WEEKLY RECALIBRATION ─────────────────────────────────
+// ── MAIN RECALIBRATION ────────────────────────────────────────
 async function runWeeklyRecalibration() {
-  const start = Date.now();
+  const startTime = Date.now();
   console.log('\n' + '='.repeat(60));
   console.log('WEEKLY RECALIBRATION STARTED');
   console.log('='.repeat(60));
 
+  // Incremental check
+  const existingCal  = await fb.getLastCalibration().catch(() => null);
+  const existingInst = await fb.getAllInstruments().catch(() => ({}));
+  const hasExisting  = Object.keys(existingInst || {}).length > 100;
+  const FETCH_DAYS   = hasExisting ? 14 : 365;
+  console.log(`  Mode: ${hasExisting ? `INCREMENTAL (${FETCH_DAYS} days)` : 'FULL (365 days)'}`);
+
   const stats = {
-    total: 0, calibrated: 0, valuations: 0,
-    errors: [], skipped: [],
+    total: 0, calibrated: 0, errors: [], skipped: [],
     started_at: new Date().toISOString(),
   };
 
-  // ── 1. Get Nifty 500 list from NSE ────────────────────────
-  console.log('\n[1/6] Fetching Nifty 500 list...');
-  const nifty500 = await nse.getNifty500List();
-  if (nifty500.length === 0) {
-    console.error('Failed to fetch Nifty 500 list — aborting');
-    return;
+  // ── 1. NIFTY 500 LIST ────────────────────────────────────
+  console.log('\n[1/5] Fetching Nifty 500 list...');
+  let nifty500 = [];
+  try {
+    nifty500 = await nse.getNifty500List();
+    console.log(`Nifty 500: ${nifty500.length} stocks`);
+    await fb.saveUniverse({ nifty500 });
+  } catch(e) {
+    console.log('Nifty500 error:', e.message);
+    // Use existing instruments as fallback
+    const existing = await fb.getAllInstruments().catch(() => ({}));
+    nifty500 = Object.values(existing)
+      .filter(i => i.country === 'IN' || !i.country)
+      .map(i => ({ symbol: i.symbol||i.nse, name: i.name, sector: i.sector }))
+      .filter(i => i.symbol);
+    console.log(`Using ${nifty500.length} existing India instruments`);
   }
-  stats.total = nifty500.length;
 
-  // Save universe list to Firebase
-  await fb.saveUniverse('nifty500', nifty500.map(s => s.symbol));
-  await fb.saveUniverse('nifty50',  nifty500.slice(0, 50).map(s => s.symbol));
-  console.log(`Nifty 500 list saved: ${nifty500.length} stocks`);
+  // ── 2. REGIME CLASSIFICATION ─────────────────────────────
+  console.log('\n[2/5] Classifying regimes from Nifty 50 history...');
+  let regimePeriods = {};
+  try {
+    const niftyHist = await stooq.getPriceHistory('NIFTY 50', null, null, 365);
+    if (niftyHist && niftyHist.length >= 60) {
+      regimePeriods = classifyRegimePeriods(niftyHist);
+    } else {
+      // Fallback: use NSEI (Nifty 50 on Stooq)
+      const nsei = await stooq.getPriceHistory('NSEI', null, null, 365);
+      if (nsei && nsei.length >= 60) regimePeriods = classifyRegimePeriods(nsei);
+    }
+  } catch(e) {
+    console.log('Regime classification error:', e.message);
+  }
 
-  // ── 2. Get Nifty 50 price history for regime classification ─
-  console.log('\n[2/6] Fetching Nifty 50 history for regime classification...');
-  const niftyHistory = await nse.getPriceHistory('NIFTY 50');
-  const regimePeriods = niftyHistory ? classifyRegimes(niftyHistory) : [];
-  console.log(`Regime periods classified: ${regimePeriods.length} days`);
+  // ── 3. SCREENER VALUATIONS (top 200 only) ────────────────
+  console.log('\n[3/5] Fetching Screener valuations (top 200)...');
+  const top200     = nifty500.slice(0, 200).map(s => s.symbol);
+  let valuations   = {};
+  try {
+    const result = await screener.getBatchValuations(top200, 400);
+    valuations   = result.valuations || {};
+    console.log(`  Valuations: ${Object.keys(valuations).length} fetched`);
+  } catch(e) {
+    console.log('Screener error:', e.message);
+  }
 
-  // Log regime distribution
-  const regimeCounts = {};
-  regimePeriods.forEach(r => { regimeCounts[r.regime] = (regimeCounts[r.regime] || 0) + 1; });
-  console.log('Regime distribution:', regimeCounts);
+  // ── 4. INDIA STOCKS — price history via Stooq ────────────
+  console.log(`\n[4/5] Calibrating ${nifty500.length} India stocks via Stooq...`);
 
-  // ── 3. Get Screener valuations (top 200 first) ────────────
-  console.log('\n[3/6] Fetching Screener.in valuations...');
-  const top200 = nifty500.slice(0, 200).map(s => s.symbol);
-  const { valuations, errors: screenerErrors } = await screener.getBatchValuations(top200, 500);
-  stats.valuations = Object.keys(valuations).length;
-  console.log(`Valuations: ${stats.valuations} fetched`);
+  const calibrated = {};
+  const priceHistories = {};
 
-  // ── 4. Calculate calibration for each stock ───────────────
-  console.log('\n[4/6] Calculating calibration for each stock...');
-  const calibratedInstruments = {};
+  // Process in batches of 20 with delays
+  const BATCH = 20;
+  for (let i = 0; i < nifty500.length; i += BATCH) {
+    const batch = nifty500.slice(i, i + BATCH);
 
-  // Process SEQUENTIALLY with delays to avoid NSE rate limiting
-  const batchSize = 20;
-  for (let i = 0; i < nifty500.length; i += batchSize) {
-    const batch = nifty500.slice(i, i + batchSize);
-
-    // Sequential - one at a time with delay to avoid NSE blocking
+    // Sequential within batch — avoid rate limits
     for (const stock of batch) {
-      await (async (stock) => {
       try {
-        // Get price history for this stock
-        const history = await nse.getPriceHistory(stock.symbol);
-        await nse.sleep(800); // 800ms between requests — NSE won't block
+        const history = await stooq.getPriceHistory(stock.symbol, null, null, FETCH_DAYS);
 
-        // Debug: log first 3 stocks to see what Yahoo returns
+        // Debug first few
         if (stats.calibrated + stats.skipped.length < 3) {
           console.log(`  DEBUG ${stock.symbol}: history=${history ? history.length + ' rows' : 'NULL'}`);
         }
 
-        if (!history || history.length < 30) {
+        if (!history || history.length < 10) {
           stats.skipped.push(stock.symbol);
-          // Save basic data even without calibration
-          calibratedInstruments[stock.symbol] = {
-            symbol:  stock.symbol,
-            name:    stock.name,
-            sector:  stock.sector,
-            nse:     stock.symbol,
-            country: 'IN',
-            calibration: {
-              base_returns: { BULL: 20, SOFT_BULL: 10, SIDEWAYS: 3, SOFT_BEAR: -5, BEAR: -15 },
-              sigma:        { BULL: 0.30, SOFT_BULL: 0.25, SIDEWAYS: 0.20, SOFT_BEAR: 0.28, BEAR: 0.40 },
-              source:       'fallback',
-              history_days: 0,
-            },
-            last_price:   stock.lastPrice || 0,
-            valuation:    valuations[stock.symbol] || null,
-            calibrated_at: new Date().toISOString(),
-          };
-          return;
+          // Save with fallback calibration
+          calibrated[stock.symbol] = buildFallback(stock, valuations);
+          continue;
         }
 
-        // Calculate sigma and base returns from real price data
-        const sigma       = calculateSigma(history, regimePeriods);
-        const baseReturns = calculateBaseReturns(history, regimePeriods);
-
-        // Get historical PE for valuation context
-        let historicalPE = null;
-        if (valuations[stock.symbol]?.pe) {
-          historicalPE = await screener.getHistoricalPE(stock.symbol);
-          await nse.sleep(300);
+        // Merge with existing if incremental
+        let fullHistory = history;
+        if (hasExisting && existingInst[stock.symbol]?._price_history?.length > 0) {
+          const existing = existingInst[stock.symbol]._price_history;
+          // Append new bars, deduplicate by date
+          const existingDates = new Set(existing.map(h => h.date));
+          const newBars = history.filter(h => !existingDates.has(h.date));
+          fullHistory = [...existing, ...newBars].slice(-252); // keep last 252
         }
 
-        // Store last 252 days of price history for GARCH/DCC
-        const priceHistory = history.slice(-252).map(d => ({
-          date:  d.date,
-          close: d.close,
-          high:  d.high  || d.close,
-          low:   d.low   || d.close,
-          vol:   d.vol   || 0,
-        }));
-        // Collect for SQLite upload
-        allPriceHistories[stock.symbol] = priceHistory;
+        priceHistories[stock.symbol] = fullHistory;
 
-        calibratedInstruments[stock.symbol] = {
-          symbol:   stock.symbol,
-          name:     stock.name,
-          sector:   stock.sector,
-          nse:      stock.symbol,
-          country:  'IN',
-          calibration: {
-            base_returns:  baseReturns,
-            sigma,
-            source:        'calculated',
-            history_days:  history.length,
-            regime_periods: regimePeriods.length,
-            pe_5yr_avg:    historicalPE?.pe_5yr_avg || null,
-            pe_min:        historicalPE?.pe_min     || null,
-            pe_max:        historicalPE?.pe_max     || null,
-          },
-          last_price:    history[history.length - 1]?.close || stock.lastPrice,
-          week52_high:   Math.max(...history.map(d => d.high || d.close)),
-          week52_low:    Math.min(...history.map(d => d.low  || d.close)),
-          valuation:     valuations[stock.symbol] || null,
-          calibrated_at:  new Date().toISOString(),
-        };
-
+        calibrated[stock.symbol] = buildCalibrated(stock, fullHistory, regimePeriods, valuations);
         stats.calibrated++;
-      } catch (e) {
-        console.error(`Error calibrating ${stock.symbol}:`, e.message);
+
+      } catch(e) {
         stats.errors.push({ symbol: stock.symbol, error: e.message });
+        calibrated[stock.symbol] = buildFallback(stock, valuations);
       }
-      })(stock);
+
+      await sleep(300); // 300ms between requests
     }
 
-    // Save batch to B2
-    if (Object.keys(calibratedInstruments).length > 0) {
-      await fb.bulkSaveInstruments(calibratedInstruments);
-      console.log(`  Progress: ${i + batchSize}/${nifty500.length} | Calibrated: ${stats.calibrated}`);
-    }
-
-    await nse.sleep(3000); // 3 seconds between batches
+    // Save batch progress
+    await fb.bulkSaveInstruments(calibrated);
+    console.log(`  Progress: ${Math.min(i + BATCH, nifty500.length)}/${nifty500.length} | Calibrated: ${stats.calibrated}`);
+    await sleep(1000); // 1s between batches
   }
 
-  // ── 5. Add ALL US stocks with real price history ─────────────
-  console.log('\n[5/6] Calibrating all US stocks from Yahoo price history...');
-  const { US_UNIVERSE, getAllUSSymbols, getYahooSymbol } = require('../shared/us_instruments');
-
+  // ── 5. US STOCKS ─────────────────────────────────────────
+  console.log('\n[5/5] Calibrating US stocks via Stooq...');
   const usInstruments = {};
-  const allUSSymbols  = getAllUSSymbols();
 
-  for (const symbol of allUSSymbols) {
+  for (const [sym, meta] of Object.entries(US_UNIVERSE || {})) {
     try {
-      const yahooSym  = getYahooSymbol(symbol);
-      const usMeta    = US_UNIVERSE[symbol];
+      const history = await stooq.getPriceHistory(sym, null, null, FETCH_DAYS);
 
-      // Fetch 52-week price history from Yahoo
-      const r = await new Promise(resolve => {
-        const https  = require('https');
-        const zlib   = require('zlib');
-        const end    = Math.floor(Date.now() / 1000);
-        const start  = end - 365 * 24 * 3600;
-        const url    = `/v8/finance/chart/${yahooSym}?interval=1d&period1=${start}&period2=${end}`;
-        const req    = https.get({
-          hostname: 'query1.finance.yahoo.com',
-          path:     url,
-          headers:  { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'Accept-Encoding': 'gzip' },
-          timeout:  10000,
-        }, res => {
-          let data   = '';
-          let stream = res;
-          if (res.headers['content-encoding'] === 'gzip') stream = res.pipe(zlib.createGunzip());
-          stream.on('data', c => data += c.toString());
-          stream.on('end', () => {
-            try { resolve({ ok: true, data: JSON.parse(data) }); }
-            catch (e) { resolve({ ok: false }); }
-          });
-        });
-        req.on('error', () => resolve({ ok: false }));
-        req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
-      });
-
-      let calibration = {
-        base_returns: { BULL: 25, SOFT_BULL: 12, SIDEWAYS: 5, SOFT_BEAR: -5, BEAR: -20 },
-        sigma:        { BULL: 0.30, SOFT_BULL: 0.25, SIDEWAYS: 0.20, SOFT_BEAR: 0.28, BEAR: 0.40 },
-        source:       'fallback',
-        history_days: 0,
-      };
-
-      if (r.ok && r.data?.chart?.result?.[0]) {
-        const result  = r.data.chart.result[0];
-        const closes  = result.indicators?.quote?.[0]?.close || [];
-        const times   = result.timestamp || [];
-        const history = times.map((t, i) => ({ date: new Date(t*1000).toISOString().slice(0,10), close: closes[i] }))
-          .filter(d => d.close);
-
-        if (history.length >= 30) {
-          // Use same regime periods from Nifty 50 as proxy
-          // (US regime roughly correlates with India regime)
-          const sigma       = calculateSigma(history, regimePeriods);
-          const baseReturns = calculateBaseReturns(history, regimePeriods);
-          calibration = {
-            base_returns:  baseReturns,
-            sigma,
-            source:        'calculated',
-            history_days:  history.length,
-          };
-        }
+      if (!history || history.length < 10) {
+        usInstruments[sym] = buildUSFallback(sym, meta);
+        continue;
       }
 
-      usInstruments[symbol] = {
-        symbol,
-        name:     usMeta.name,
-        sector:   usMeta.sector,
-        rc:       usMeta.rc,
-        country:  'US',
-        dv:       usMeta.dv || 0,
-        tags:     usMeta.tags || [],
-        yourPos:  usMeta.yourPos || null,
-        calibration,
-        calibrated_at: new Date().toISOString(),
-      };
+      let fullHistory = history;
+      if (hasExisting && existingInst[sym]?._price_history?.length > 0) {
+        const existing     = existingInst[sym]._price_history;
+        const existingDates= new Set(existing.map(h => h.date));
+        const newBars      = history.filter(h => !existingDates.has(h.date));
+        fullHistory        = [...existing, ...newBars].slice(-252);
+      }
 
-      await nse.sleep(200);
-    } catch (e) {
-      console.error(`US calibration error ${symbol}:`, e.message);
+      priceHistories[sym]  = fullHistory;
+      usInstruments[sym]   = buildUSCalibrated(sym, meta, fullHistory, regimePeriods);
+      stats.calibrated++;
+
+    } catch(e) {
+      usInstruments[sym] = buildUSFallback(sym, meta);
     }
+    await sleep(300);
   }
 
   await fb.bulkSaveInstruments(usInstruments);
-  await fb.saveUniverse('us_stocks', allUSSymbols);
-  console.log(`US stocks calibrated: ${Object.keys(usInstruments).length}/${allUSSymbols.length}`);
+  console.log(`  US stocks calibrated: ${Object.keys(usInstruments).length}`);
 
-  // AI context generation skipped (function removed)
-  await fb.saveCalibrationRun(stats);
+  // Save calibration run metadata
+  const elapsed = Math.round((Date.now() - startTime) / 1000);
+  await fb.saveCalibrationRun({
+    total:     nifty500.length + Object.keys(US_UNIVERSE||{}).length,
+    calibrated:stats.calibrated,
+    skipped:   stats.skipped.length,
+    errors:    stats.errors.length,
+    elapsed,
+    instruments: { ...calibrated, ...usInstruments },
+    regime_periods: regimePeriods,
+    completed_at: new Date().toISOString(),
+  });
 
   console.log('\n' + '='.repeat(60));
   console.log('RECALIBRATION COMPLETE');
-  console.log(`  Total stocks:  ${stats.total}`);
-  console.log(`  Calibrated:    ${stats.calibrated}`);
-  console.log(`  Valuations:    ${stats.valuations}`);
-  console.log(`  Skipped:       ${stats.skipped.length}`);
-  console.log(`  Errors:        ${stats.errors.length}`);
-  console.log(`  Time:          ${Math.round(elapsed/60)}m ${elapsed%60}s`);
+  console.log(`  Total:      ${stats.calibrated + stats.skipped.length}`);
+  console.log(`  Calibrated: ${stats.calibrated}`);
+  console.log(`  Skipped:    ${stats.skipped.length}`);
+  console.log(`  Errors:     ${stats.errors.length}`);
+  console.log(`  Time:       ${Math.floor(elapsed/60)}m ${elapsed%60}s`);
   console.log('='.repeat(60));
 
-  return stats;
+  return { ok: true, calibrated: stats.calibrated };
 }
 
-module.exports = { runWeeklyRecalibration, classifyRegimes, calculateSigma, calculateBaseReturns };
+// ── HELPERS ───────────────────────────────────────────────────
+function calcSigma(history, regimePeriods) {
+  const DEFAULTS = { BULL:0.22, SOFT_BULL:0.26, SIDEWAYS:0.20, SOFT_BEAR:0.30, BEAR:0.42 };
+  if (!history || history.length < 20) return DEFAULTS;
+
+  // Tag bars with regime
+  history.forEach(bar => { bar._regime = regimePeriods?.[bar.date]; });
+
+  const regimeRets = { BULL:[], SOFT_BULL:[], SIDEWAYS:[], SOFT_BEAR:[], BEAR:[] };
+  for (let i=1;i<history.length;i++) {
+    const r = history[i]._regime;
+    if (!r || !regimeRets[r]) continue;
+    const ret = (history[i].close - history[i-1].close) / history[i-1].close;
+    regimeRets[r].push(ret);
+  }
+
+  const sigma = { ...DEFAULTS };
+  Object.entries(regimeRets).forEach(([regime, rets]) => {
+    if (rets.length < 10) return;
+    const mean = rets.reduce((s,r)=>s+r,0)/rets.length;
+    const variance = rets.reduce((s,r)=>s+(r-mean)**2,0)/rets.length;
+    sigma[regime] = parseFloat(Math.sqrt(variance*252).toFixed(4));
+  });
+  return sigma;
+}
+
+function calcBaseReturns(history, regimePeriods) {
+  const DEFAULTS = { BULL:20, SOFT_BULL:10, SIDEWAYS:3, SOFT_BEAR:-5, BEAR:-15 };
+  if (!history || history.length < 20) return DEFAULTS;
+
+  history.forEach(bar => { bar._regime = regimePeriods?.[bar.date]; });
+  const regimeRets = { BULL:[], SOFT_BULL:[], SIDEWAYS:[], SOFT_BEAR:[], BEAR:[] };
+  for (let i=1;i<history.length;i++) {
+    const r = history[i]._regime;
+    if (!r || !regimeRets[r]) continue;
+    const ret = (history[i].close - history[i-1].close) / history[i-1].close;
+    regimeRets[r].push(ret);
+  }
+
+  const bReturns = { ...DEFAULTS };
+  Object.entries(regimeRets).forEach(([regime, rets]) => {
+    if (rets.length < 10) return;
+    const ann = (rets.reduce((s,r)=>s+r,0)/rets.length) * 252 * 100;
+    bReturns[regime] = parseFloat(ann.toFixed(1));
+  });
+  return bReturns;
+}
+
+function buildCalibrated(stock, history, regimePeriods, valuations) {
+  const sigma      = calcSigma(history, regimePeriods);
+  const bReturns   = calcBaseReturns(history, regimePeriods);
+  const closes     = history.map(h => h.close);
+  const lastPrice  = closes[closes.length-1] || 0;
+  const week52High = Math.max(...closes.slice(-252));
+  const week52Low  = Math.min(...closes.slice(-252));
+
+  return {
+    symbol:      stock.symbol,
+    name:        stock.name,
+    sector:      stock.sector,
+    nse:         stock.symbol,
+    country:     'IN',
+    last_price:  lastPrice,
+    week52_high: week52High,
+    week52_low:  week52Low,
+    calibration: { sigma, base_returns: bReturns, source: 'calculated', history_days: history.length },
+    valuation:   valuations[stock.symbol] || null,
+    calibrated_at: new Date().toISOString(),
+    _price_history: history.slice(-252),
+  };
+}
+
+function buildFallback(stock, valuations) {
+  return {
+    symbol:    stock.symbol, name: stock.name, sector: stock.sector,
+    nse:       stock.symbol, country: 'IN', last_price: stock.lastPrice || 0,
+    calibration: {
+      sigma:        { BULL:0.22, SOFT_BULL:0.26, SIDEWAYS:0.20, SOFT_BEAR:0.30, BEAR:0.42 },
+      base_returns: { BULL:20,   SOFT_BULL:10,   SIDEWAYS:3,    SOFT_BEAR:-5,   BEAR:-15  },
+      source: 'fallback', history_days: 0,
+    },
+    valuation:   valuations[stock.symbol] || null,
+    calibrated_at: new Date().toISOString(),
+  };
+}
+
+function buildUSCalibrated(sym, meta, history, regimePeriods) {
+  const sigma    = calcSigma(history, regimePeriods);
+  const bReturns = calcBaseReturns(history, regimePeriods);
+  const closes   = history.map(h => h.close);
+  const lastPrice= closes[closes.length-1] || 0;
+
+  return {
+    symbol:     sym, name: meta.name, sector: meta.sector,
+    country:    'US', last_price: lastPrice,
+    calibration:{ sigma, base_returns: bReturns, source: 'calculated', history_days: history.length },
+    calibrated_at: new Date().toISOString(),
+    _price_history: history.slice(-252),
+  };
+}
+
+function buildUSFallback(sym, meta) {
+  return {
+    symbol: sym, name: meta?.name, sector: meta?.sector, country: 'US', last_price: 0,
+    calibration: {
+      sigma:        { BULL:0.28, SOFT_BULL:0.24, SIDEWAYS:0.22, SOFT_BEAR:0.32, BEAR:0.45 },
+      base_returns: { BULL:25,   SOFT_BULL:12,   SIDEWAYS:5,    SOFT_BEAR:-8,   BEAR:-18  },
+      source: 'fallback', history_days: 0,
+    },
+    calibrated_at: new Date().toISOString(),
+  };
+}
+
+module.exports = { runWeeklyRecalibration };

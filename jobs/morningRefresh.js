@@ -1,301 +1,293 @@
-// ═══════════════════════════════════════════════════════════════
-// Morning Refresh — Phase 3
-// Reads instrument calibration from Firebase (not hardcoded)
-// Fetches all live data, runs AI, stores results, sends WhatsApp
-// ═══════════════════════════════════════════════════════════════
-const nse = require('../scrapers/nse');
-const fb  = require('../db');
-const ai  = require('../ai');
-const tg  = require('../telegram'); // free Telegram notifications
-const fcm = require('../fcm');     // Android push notifications (free)
+// ── MORNING REFRESH ────────────────────────────────────────────
+// Runs 6× daily — fetches prices, scores all instruments
+// Uses 5-layer master scorer (no Python dependency)
 
+'use strict';
+
+const fb         = require('../db');
+const nse        = require('../scrapers/nse');
+const { scoreAllInstruments } = require('../scoring/masterScorer');
+const ai         = require('../ai');
+const fcm        = require('../fcm');
+const tg         = require('../telegram');
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── LABEL FOR THIS REFRESH ────────────────────────────────────
+function getSnapshotLabel() {
+  const h = new Date().getUTCHours();
+  const m = new Date().getUTCMinutes();
+  const t = h * 60 + m;
+  if (t < 210)  return 'US Close 1:30 AM IST';
+  if (t < 330)  return 'India Pre-Open';
+  if (t < 390)  return 'India Open 9:00 AM IST';
+  if (t < 540)  return 'India Midday 12:00 PM IST';
+  if (t < 570)  return 'India Close 3:00 PM IST';
+  if (t < 810)  return 'US Open 7:00 PM IST';
+  if (t < 1020) return 'US Midday 10:00 PM IST';
+  return 'After Hours';
+}
+
+// ── MAIN ──────────────────────────────────────────────────────
 async function runMorningRefresh() {
-  const start = Date.now();
+  const t0 = Date.now();
   console.log('\n' + '='.repeat(50));
-  console.log('MORNING REFRESH — ' + new Date().toISOString());
+  console.log(`MORNING REFRESH — ${new Date().toISOString()}`);
   console.log('='.repeat(50));
 
-  const snap = {
-    label:    'India Open 9:00 AM',
-    ts:       new Date().toISOString(),
-    prices:   {},
-    fii:      null,
-    indices:  {},
-    gainers:  [],
-    losers:   [],
-    results:  [],
-    dividends:[],
-    usdInr:   null,
-    brent:    null,
-    gold:     null,
-    usPrices: {},
-    regime:   'SIDEWAYS',
-    errors:   [],
-    success:  [],
+  const label = getSnapshotLabel();
+  const snap  = {
+    ts:      new Date().toISOString(),
+    label,
+    regime:  'SIDEWAYS',
+    errors:  [],
+    success: [],
+    model:   'five-layer-v1',
   };
 
-  // 1. Load instruments from Firebase (not hardcoded)
-  console.log('Loading instruments from Firebase...');
-  const instruments = await fb.getAllInstruments();
-  const instCount   = Object.keys(instruments).length;
-  console.log(`Loaded ${instCount} instruments`);
-
-  // If no instruments yet (first run) — this is ok, AI will still work
-  if (instCount === 0) {
-    snap.errors.push('no_instruments: run weekly recalibration first');
-  }
-
-  // 2. Get Nifty 500 symbol list
-  const nifty500Syms = await fb.getUniverse('nifty500');
-  // Handle first run before recalibration — use hardcoded top stocks
-  const DEFAULT_SYMBOLS = [
-    'TCS','INFY','HCLTECH','WIPRO','PERSISTENT','LTIM','SUNPHARMA','DRREDDY',
-    'ICICIBANK','HDFCBANK','SBIN','AXISBANK','BAJFINANCE','HAL','BEL','MARUTI',
-    'TATAMOTORS','HINDUNILVR','ITC','LT','NTPC','ONGC','RELIANCE','BHARTIARTL',
-    'DLF','TATASTEEL','DIXION','GOLDBEES','INDIGO','BAJAJFINSV',
-  ];
-  const instSymbols = Object.values(instruments || {})
-    .filter(i => i && i.country === 'IN' && (i.nse || i.symbol))
-    .map(i => i.nse || i.symbol)
-    .slice(0, 100);
-  const symbolsToFetch = nifty500Syms.length > 0
-    ? nifty500Syms.slice(0, 100)
-    : instSymbols.length > 0
-      ? instSymbols
-      : DEFAULT_SYMBOLS;
-
-  // 3. Fetch live NSE prices
-  console.log(`Fetching prices for ${symbolsToFetch.length} stocks...`);
-  await nse.refreshCookie();
-  await nse.sleep(2000);
-
-  const { prices } = await nse.getBulkQuotes(symbolsToFetch);
-  snap.prices   = prices;
-  snap.success.push(`prices:${Object.keys(prices).length}`);
-
-  // Update last_price in Firebase instruments
-  const priceUpdates = {};
-  Object.entries(prices).forEach(([sym, price]) => {
-    priceUpdates[sym] = { last_price: price, price_updated_at: new Date().toISOString() };
-  });
-  if (Object.keys(priceUpdates).length > 0) {
-    await fb.bulkSaveInstruments(priceUpdates);
-  }
-
-  // 4. FII/DII
-  const fii = await nse.getFII();
-  if (fii) {
-    snap.fii = fii;
-    snap.success.push(`fii:${fii.fii_net}Cr`);
-  } else {
-    snap.errors.push('fii:failed');
-  }
-
-  // 5. Indices
-  const indices = await nse.getIndices();
-  snap.indices  = indices;
-  snap.success.push(`indices:${Object.keys(indices).length}`);
-
-  // 6. Gainers/Losers
-  const movers  = await nse.getMovers();
-  snap.gainers  = movers.gainers;
-  snap.losers   = movers.losers;
-
-  // 7. Results calendar
-  const cal     = await nse.getResultsCalendar();
-  snap.results  = cal.results;
-  snap.dividends= cal.dividends;
-
-  // 8. Yahoo macro + ALL US prices (105 stocks)
-  const { US_UNIVERSE, getYahooSymbol, getAllUSSymbols } = require('../shared/us_instruments');
-  const macro     = await nse.getMacro();
-  const allUSSyms = getAllUSSymbols().map(getYahooSymbol);
-  const usPrices  = await nse.getAllUSPrices(allUSSyms);
-
-  if (macro.usdInr) {
-    snap.usdInr  = macro.usdInr;
-    snap.brent   = macro.brent;
-    snap.gold    = macro.gold;
-    snap.usPrices= usPrices;
-    snap.success.push(`yahoo:${macro.usdInr} | usPrices:${Object.keys(usPrices).length}`);
-  } else {
-    snap.errors.push('yahoo:macro_failed');
-    snap.usPrices = usPrices; // still save prices even if macro failed
-  }
-
-  // Update US prices in Firebase instruments
-  const usUpdates = {};
-  Object.entries(usPrices).forEach(([sym, price]) => {
-    usUpdates[sym] = { last_price: price, price_updated_at: new Date().toISOString() };
-  });
-  if (Object.keys(usUpdates).length > 0) await fb.bulkSaveInstruments(usUpdates);
-
-  // 9. Regime classification
-  const fiiNet  = snap.fii?.fii_net || 0;
-  const vix     = snap.indices?.['INDIA VIX']?.last || 18;
-  const niftyChg= snap.indices?.['NIFTY 50']?.pChange || 0;
-  let regScore  = 0;
-  if (fiiNet > 3000)        regScore += 2;
-  else if (fiiNet > 0)      regScore += 1;
-  else if (fiiNet < -5000)  regScore -= 2;
-  else if (fiiNet < 0)      regScore -= 1;
-  if (vix < 14)             regScore += 2;
-  else if (vix < 18)        regScore += 0;
-  else if (vix > 22)        regScore -= 2;
-  else if (vix > 18)        regScore -= 1;
-  if (niftyChg > 1)         regScore += 1;
-  else if (niftyChg < -1)   regScore -= 1;
-  snap.regime       = regScore >= 3 ? 'BULL' : regScore >= 1 ? 'SOFT_BULL' : regScore >= -1 ? 'SIDEWAYS' : regScore >= -3 ? 'SOFT_BEAR' : 'BEAR';
-  snap.regime_score = regScore;
-
-  // 10. News — read from Firebase (newsLoop updates 24/7, no need to fetch here)
-  const { getStockNewsMultiple, getMarketNews } = require('./newsLoop');
-  const topStocks = ['HAL','ONGC','TCS','ICICIBANK','RELIANCE','BEL','PERSISTENT',
-                     'NET','CEG','GLNG','NVDA','MSFT','META','LNG','BHARTIARTL'];
-  const [newsItems, mkNews] = await Promise.all([
-    getStockNewsMultiple(topStocks).catch(() => ({})),
-    getMarketNews().catch(() => []),
-  ]);
-  snap.success.push(`news:${Object.keys(newsItems).length}stocks_from_firebase`);
-
-  // 11. Save snapshot
-  await fb.saveSnapshot(snap);
-
-  let scores = {}; // initialized here, populated by Python engine or Haiku fallback
-
-  // 12. Run Python Quant Engine (GARCH + DCC + Factor Model + Monte Carlo)
-  console.log('Running Python quant engine...');
-  const prefs = await fb.getPreferences();
+  // ── 1. LOAD INSTRUMENTS FROM B2 ──────────────────────────
+  console.log('Loading instruments from B2...');
+  let instruments = {};
   try {
-    const { execSync } = require('child_process');
-    const pyResult = execSync(
-      'python3 scoring/run_scoring.py',
-      {
-        cwd:     '/opt/render/project/src',
-        timeout: 300000,
-        env:     { ...process.env },
-      }
-    ).toString();
-    const lines    = pyResult.trim().split('\n');
-    const jsonLine = lines.filter(l => l.startsWith('{')).pop();
-    const result   = jsonLine ? JSON.parse(jsonLine) : {};
-    if (result.ok) {
-      console.log(`Python quant engine complete ✅ (${result.scored} scored, ${result.elapsed}s)`);
-      snap.success = snap.success || [];
-      snap.success.push(`quant:${result.scored}stocks`);
-      snap.model = 'python-quant-v1';
-      await fb.saveSnapshot(snap);
-    } else {
-      throw new Error(result.error || 'Python engine returned ok:false');
+    instruments = await fb.getAllInstruments();
+    console.log(`Loaded ${Object.keys(instruments).length} instruments`);
+    if (Object.keys(instruments).length === 0) {
+      console.log('No instruments — triggering recalibration first');
+      const { runWeeklyRecalibration } = require('./weeklyRecalibration');
+      await runWeeklyRecalibration();
+      instruments = await fb.getAllInstruments();
     }
   } catch(e) {
-    console.log('Python engine error:', e.message?.slice(0, 200));
-    snap.errors = snap.errors || [];
-    snap.errors.push('quant:' + (e.message?.slice(0,100) || 'failed'));
-    await runHaikuFallback(snap, instruments);
+    console.log('Instrument load error:', e.message);
+    snap.errors.push('instruments:' + e.message.slice(0,50));
   }
 
-  // 14. News already in Firebase from continuous newsLoop — no manual save needed
+  // ── 2. FETCH NSE BULK QUOTES ──────────────────────────────
+  console.log('Fetching NSE bulk quotes...');
+  try {
+    const allSymbols = Object.keys(instruments).filter(k => instruments[k].country !== 'US');
+    const chunks     = [];
+    for (let i = 0; i < allSymbols.length; i += 100) chunks.push(allSymbols.slice(i, i+100));
 
-  // 15. Send FCM push notification (free) + Telegram
-
-  // FCM push to Android app (free, primary)
-  const analysis = await fb.getLatestAIAnalysis().catch(() => ({}));
-  const fcmResult = await fcm.sendMorningBrief(snap, analysis?.scores, prefs.portfolio);
-  if (fcmResult.ok) {
-    await fb.logAlert({ type: 'MORNING_BRIEF_FCM', messageId: fcmResult.messageId });
+    for (const chunk of chunks) {
+      const quotes = await nse.getBulkQuotes(chunk);
+      if (quotes) {
+        Object.entries(quotes).forEach(([sym, q]) => {
+          if (instruments[sym] && q.price) instruments[sym].last_price = q.price;
+        });
+        snap.success.push(`prices:${Object.keys(quotes).length}`);
+        console.log(`  Prices: ${Object.keys(quotes).length}/${chunk.length}`);
+      }
+      await sleep(1000);
+    }
+  } catch(e) {
+    console.log('NSE quotes error:', e.message);
+    snap.errors.push('quotes:' + e.message.slice(0,50));
   }
 
-  // Telegram notification (free)
-  await tg.sendMorningBrief(snap, analysis?.scores, prefs.portfolio).catch(e => console.log('Telegram error:', e.message));
+  // ── 3. FETCH US PRICES ────────────────────────────────────
+  console.log('Fetching US prices...');
+  try {
+    const macro = await nse.getMacro();
+    if (macro.usdInr) {
+      snap.usdInr   = macro.usdInr;
+      snap.brent    = macro.brent;
+      snap.gold     = macro.gold;
+    }
+    if (macro.usPrices) {
+      snap.usPrices = macro.usPrices;
+      Object.entries(macro.usPrices).forEach(([sym, price]) => {
+        if (instruments[sym]) instruments[sym].last_price = price;
+      });
+      snap.success.push(`us_prices:${Object.keys(macro.usPrices).length}`);
+    }
+  } catch(e) {
+    console.log('US prices error:', e.message);
+    snap.errors.push('us_prices:' + e.message.slice(0,50));
+  }
 
+  // ── 4. FETCH FII DATA ─────────────────────────────────────
+  try {
+    const fii = await nse.getFIIData();
+    if (fii) {
+      snap.fii = fii;
+      snap.success.push('fii:ok');
+    }
+  } catch(e) {
+    snap.errors.push('fii:' + e.message.slice(0,30));
+  }
 
-  const elapsed = Math.round((Date.now() - start) / 1000);
-  console.log(`\n✅ Morning refresh done in ${elapsed}s`);
-  console.log(`   Regime: ${snap.regime} (${regScore})`);
-  console.log(`   Prices: ${Object.keys(snap.prices).length}`);
+  // ── 5. FETCH INDICES ──────────────────────────────────────
+  try {
+    const indices = await nse.getIndices();
+    if (indices) {
+      snap.indices = indices;
+      snap.success.push('indices:ok');
+    }
+  } catch(e) {
+    snap.errors.push('indices:' + e.message.slice(0,30));
+  }
 
-  return { snap, scores };
-}
+  // ── 6. DETECT REGIME ──────────────────────────────────────
+  try {
+    const niftyLast  = snap.indices?.['NIFTY 50']?.last || 0;
+    const niftyPrev  = snap.indices?.['NIFTY 50']?.previousClose || niftyLast;
+    const fii        = snap.fii?.fii_net || 0;
+    const vix        = snap.indices?.['INDIA VIX']?.last || 17;
 
-async function runMiddayUpdate() {
-  const prevSnap = await fb.getLatestSnapshot();
-  const prefs    = await fb.getPreferences();
+    // Simple regime from VIX + FII + momentum
+    const pChange    = niftyPrev > 0 ? (niftyLast - niftyPrev) / niftyPrev * 100 : 0;
+    let regime       = 'SIDEWAYS';
 
-  await nse.refreshCookie();
-  await nse.sleep(1500);
+    if      (fii < -5000 && vix > 22)  regime = 'BEAR';
+    else if (fii < -2000 && vix > 18)  regime = 'SOFT_BEAR';
+    else if (fii > 5000  && vix < 15)  regime = 'BULL';
+    else if (fii > 2000  && vix < 18)  regime = 'SOFT_BULL';
+    else if (vix > 25)                  regime = 'BEAR';
+    else if (vix < 12 && fii > 0)      regime = 'BULL';
 
-  // Quick update — prices + FII + US prices only
-  const nifty500Syms = await fb.getUniverse('nifty500');
-  const topSyms      = nifty500Syms.slice(0, 50);
-  const { prices }   = await nse.getBulkQuotes(topSyms);
-  const fii          = await nse.getFII();
-  const macro        = await nse.getMacro();
+    snap.regime       = regime;
+    snap.regime_score = Math.round(fii / 1000) || 0;
+    snap.success.push('regime:' + regime);
+  } catch(e) {
+    snap.errors.push('regime:' + e.message.slice(0,30));
+  }
 
-  const snap = {
-    ...(prevSnap || {}),
-    label:    'Midday Update',
-    ts:       new Date().toISOString(),
-    prices:   { ...(prevSnap?.prices || {}), ...prices },
-    fii:      fii || prevSnap?.fii,
-    usdInr:   macro.usdInr  || prevSnap?.usdInr,
-    brent:    macro.brent   || prevSnap?.brent,
-    usPrices: macro.usPrices || prevSnap?.usPrices || {},
-  };
+  // ── 7. FETCH GAINERS / LOSERS ─────────────────────────────
+  try {
+    const movers = await nse.getTopMovers();
+    if (movers) { snap.gainers = movers.gainers; snap.losers = movers.losers; }
+  } catch(e) { /* optional */ }
 
-  await fb.saveSnapshot(snap);
+  // ── 8. LOAD NEWS ──────────────────────────────────────────
+  console.log('Loading news from B2...');
+  let newsData = { stocks: {}, market: [] };
+  try {
+    newsData = await fb.getLatestNews() || newsData;
+  } catch(e) { snap.errors.push('news:' + e.message.slice(0,30)); }
 
-  // Threshold alerts
-  const latestAnalysis = await fb.getLatestAIAnalysis();
-  const alerts = latestAnalysis?.alerts || [];
-  for (const alert of alerts) {
-    if (alert.type === 'PRICE_MOVE' && prefs.phone) {
-      const pos = prefs.portfolio?.[alert.stock];
-      const msg = `⚡ *ALERT — ${alert.stock}*\n\nMoved ${alert.move_pct >= 0 ? '+' : ''}${alert.move_pct}% today\nCurrent: $${alert.current} | Avg: $${pos?.avg}\nP&L: ${alert.pl_pct >= 0 ? '+' : ''}${alert.pl_pct}%\n\n→ ${process.env.DASHBOARD_URL}`;
+  // ── 9. LOAD PRICE HISTORIES ───────────────────────────────
+  console.log('Loading price histories from B2...');
+  const priceHistories = {};
+  try {
+    // Price histories are stored inside instrument objects
+    Object.entries(instruments).forEach(([sym, inst]) => {
+      if (inst._price_history?.length > 0) {
+        priceHistories[sym] = inst._price_history;
+      }
+    });
+    console.log(`Price histories loaded: ${Object.keys(priceHistories).length} stocks`);
+  } catch(e) { snap.errors.push('history:' + e.message.slice(0,30)); }
+
+  // ── 10. LOAD REGIME PERIODS ───────────────────────────────
+  let regimePeriods = {};
+  try {
+    const cal = await fb.getLastCalibration();
+    regimePeriods = cal?.regime_periods || {};
+  } catch(e) { /* optional */ }
+
+  // ── 11. SCORE WITH 5-LAYER MODEL ─────────────────────────
+  console.log('Running 5-layer scoring model...');
+  let scoringResult = null;
+  try {
+    scoringResult = await scoreAllInstruments(
+      instruments, snap, newsData, priceHistories, regimePeriods
+    );
+    snap.success.push(`scored:${Object.keys(scoringResult.scores).length}`);
+    console.log(`AI scored ${Object.keys(scoringResult.scores).length} instruments. Top 5: ${scoringResult.top5?.join(', ')}`);
+  } catch(e) {
+    console.log('Scoring error:', e.message);
+    snap.errors.push('scoring:' + e.message.slice(0,50));
+    // Haiku fallback
+    try {
+      console.log('Running Haiku fallback...');
+      await runHaikuFallback(snap, instruments);
+    } catch(e2) {
+      snap.errors.push('haiku_fallback:' + e2.message.slice(0,50));
     }
   }
 
-  console.log(`Midday update done | Prices: ${Object.keys(prices).length} | Alerts: ${alerts.length}`);
-}
-
-async function runEveningSummary() {
-  const snap     = await fb.getLatestSnapshot();
-  const analysis = await fb.getLatestAIAnalysis();
-  const prefs    = await fb.getPreferences();
-
-  if (!snap || !prefs.phone) return;
-
-  if (brief) {
-    const r = await tg.sendMorningBrief(snap, scores, prefs.portfolio);
-    if (r.ok) await fb.logAlert({ type: 'EVENING_SUMMARY', phone: prefs.phone, sid: r.sid });
-    console.log(`Evening summary: ${r.ok ? '✅' : '❌'}`);
-  }
-}
-
-// Haiku fallback if Python engine fails
-async function runHaikuFallback(snap, instruments) {
-  console.log('Running Haiku fallback scoring...');
+  // ── 12. AI NARRATIVES ─────────────────────────────────────
+  let analysis = {};
   try {
-    const ai = require('../ai');
-    const [scores, chains] = await Promise.all([
-      ai.scoreAllInstruments(snap, instruments || {}).catch(() => null),
-      ai.getDominoChains(snap).catch(() => null),
-    ]);
-    const narrative = await ai.generateRegimeNarrative(snap, scores, chains).catch(() => null);
-    const portSig   = await ai.getPortfolioSignal(snap, scores).catch(() => null);
-    const fb = require('../db');
-    await fb.saveAIAnalysis({
-      scores, chains,
+    const narrative = await ai.generateRegimeNarrative(snap, scoringResult?.scores, scoringResult?.geo_signals);
+    const portSig   = await ai.getPortfolioSignal(snap, scoringResult?.scores);
+    analysis = {
       regimeNarrative: narrative,
       portfolioSignal: portSig,
-      market_mood:     'NEUTRAL',
-      generated_at:    new Date().toISOString(),
-      model:           'haiku-fallback',
-    });
+      scores:          scoringResult,
+      chains:          await ai.getDominoChains(snap, scoringResult?.scores, scoringResult?.geo_signals),
+      geo_signals:     scoringResult?.geo_signals || {},
+    };
+  } catch(e) {
+    console.log('AI narrative error:', e.message);
+    snap.errors.push('narrative:' + e.message.slice(0,50));
+  }
+
+  // ── 13. SAVE ──────────────────────────────────────────────
+  await fb.saveSnapshot(snap);
+  await fb.saveAIAnalysis(analysis);
+
+  const elapsed = Math.round((Date.now() - t0) / 1000);
+  console.log(`\n✅ Morning refresh done in ${elapsed}s`);
+  console.log(`   Regime: ${snap.regime} (${snap.regime_score})`);
+  console.log(`   Prices: ${snap.success.filter(s=>s.startsWith('prices')).join(', ')}`);
+  if (snap.errors.length > 0) console.log(`   Errors: ${snap.errors.join(', ')}`);
+
+  // ── 14. NOTIFICATIONS ─────────────────────────────────────
+  try {
+    const prefs = await fb.getPreferences();
+    if (prefs?.fcmToken) await fcm.sendMorningBrief(snap, analysis, prefs.portfolio);
+  } catch(e) { console.log('FCM error:', e.message); }
+
+  try {
+    await tg.sendMorningBrief(snap, analysis, {}).catch(e => console.log('Telegram:', e.message));
+  } catch(e) { /* optional */ }
+
+  return { snap, analysis };
+}
+
+// ── HAIKU FALLBACK (if master scorer fails) ───────────────────
+async function runHaikuFallback(snap, instruments) {
+  try {
+    const result = await ai.scoreAllInstruments(snap, instruments);
+    const analysis = {
+      regimeNarrative: await ai.generateRegimeNarrative(snap, result?.scores),
+      portfolioSignal: await ai.getPortfolioSignal(snap, result?.scores),
+      scores: result,
+    };
+    await fb.saveSnapshot(snap);
+    await fb.saveAIAnalysis(analysis);
     console.log('Haiku fallback complete ✅');
   } catch(e) {
     console.log('Haiku fallback error:', e.message);
   }
 }
 
-module.exports = { runMorningRefresh, runMiddayUpdate, runEveningSummary };
+// ── MIDDAY UPDATE (lightweight) ──────────────────────────────
+async function runMiddayUpdate() {
+  console.log(`\n🔄 Running midday update: ${new Date().toISOString()}`);
+  try {
+    const prevSnap = await fb.getLatestSnapshot();
+    const macro    = await nse.getMacro();
+    const fii      = await nse.getFIIData();
+    const indices  = await nse.getIndices();
+
+    const snap = {
+      ...prevSnap,
+      ts:       new Date().toISOString(),
+      usdInr:   macro?.usdInr  || prevSnap?.usdInr,
+      brent:    macro?.brent   || prevSnap?.brent,
+      usPrices: macro?.usPrices|| prevSnap?.usPrices || {},
+      fii:      fii            || prevSnap?.fii,
+      indices:  indices        || prevSnap?.indices,
+    };
+
+    await fb.saveSnapshot(snap);
+    console.log(`Midday update done | USD/INR: ${snap.usdInr?.toFixed(2)} | Regime: ${snap.regime}`);
+  } catch(e) {
+    console.log('Midday update error:', e.message);
+  }
+}
+
+module.exports = { runMorningRefresh, runMiddayUpdate };
