@@ -130,12 +130,22 @@ function getDateString(offsetDays = 0) {
   return d.toISOString().slice(0, 10);
 }
 
-async function getPriceHistory(symbol, fromDate, toDate) {
-  // Yahoo Finance: append .NS for NSE stocks
-  const yahooSymbol = symbol.includes('.') ? symbol : `${symbol}.NS`;
+async function getPriceHistory(symbol, fromDate, toDate, days) {
+  // Yahoo Finance: .NS for India, no suffix for US
+  const US_SYMBOLS = new Set(['NET','CEG','GLNG','NVDA','MSFT','AAPL','GOOGL','META','AMZN',
+    'TSLA','AMD','AVGO','INTC','QCOM','MU','ASML','TSM','ARM','MRVL','CRM','NOW','SNOW',
+    'DDOG','PANW','ZS','PLTR','ADBE','ORCL','WDAY','INTU','JPM','GS','MS','BAC','V','MA',
+    'BLK','SPGI','COF','JNJ','UNH','ABBV','MRK','PFE','TMO','ISRG','LLY','NVO','WMT',
+    'COST','MCD','NKE','SBUX','DIS','NFLX','LMT','RTX','NOC','GD','HII','GE','CAT','HON',
+    'UPS','FDX','XOM','CVX','COP','SLB','NEE','VST','LNG','SPY','QQQ','GLD','SOXX','EEM',
+    'INDA','INFY','HDB','RDY']);
+  const yahooSymbol = symbol.includes('.') ? symbol 
+    : US_SYMBOLS.has(symbol) ? symbol 
+    : `${symbol}.NS`;
   
+  const fetchDays = days || 365;
   const toTs   = Math.floor(Date.now() / 1000);
-  const fromTs = toTs - (365 * 24 * 3600); // 1 year back
+  const fromTs = toTs - (fetchDays * 24 * 3600);
   
   return new Promise((resolve) => {
     const https   = require('https');

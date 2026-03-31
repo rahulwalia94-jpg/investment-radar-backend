@@ -6,7 +6,7 @@
 'use strict';
 
 const fb      = require('../db');
-const stooq   = require('../scrapers/stooq');
+const stooq   = require('../scrapers/nse');  // uses Yahoo Finance chart API
 const nse     = require('../scrapers/nse');
 const screener= require('../scrapers/screener');
 const { US_UNIVERSE } = require('../shared/us_instruments');

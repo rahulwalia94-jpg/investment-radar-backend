@@ -252,15 +252,21 @@ Write 4 sections labeled exactly:
 }
 
 // ── 3. DOMINO CHAINS ─────────────────────────────────────────
-async function getDominoChains(snapshot) {
-  const prompt = `Identify 3 active domino chains driving Indian and US markets right now.
+async function getDominoChains(snapshot, scores, geoSignals) {
+  // Build active geo signals string
+  const geoStr = geoSignals ? Object.entries(geoSignals)
+    .filter(([,v]) => v.active)
+    .map(([k,v]) => `${k}: ${v.note}`)
+    .join('\n') : 'Iran war — LNG disruption active';
+
+  const prompt = `Identify 3 active domino chains driving markets right now. MUST include at least one chain that directly impacts NET, CEG, or GLNG (user's portfolio).
 
 CONDITIONS:
-- Oil: $${snapshot.brent || 90} (Iran war, Hormuz restricted)
-- FII: ${snapshot.fii?.fii_net || 0} Cr | USD/INR: ${snapshot.usdInr || 92}
-- VIX: ${snapshot.indices?.['INDIA VIX']?.last || 17.8}
-- All CBs holding rates
-- Portfolio: NET (Cloudflare), CEG (nuclear power), GLNG (LNG — Iran direct play)
+- Oil: $${snapshot.brent || 90}
+- FII: ${snapshot.fii?.fii_net || 0} Cr (${(snapshot.fii?.fii_net||0) < 0 ? 'SELLING' : 'BUYING'}) | USD/INR: ${snapshot.usdInr || 86}
+- VIX: ${snapshot.indices?.['INDIA VIX']?.last || 17.8} | Regime: ${snapshot.regime || 'SIDEWAYS'}
+- Active signals: ${geoStr}
+- Portfolio: NET (Cloudflare — cybersecurity), CEG (nuclear power — US), GLNG (LNG shipping — Iran direct play)
 
 Return ONLY valid JSON:
 {
