@@ -131,7 +131,6 @@ function getDateString(offsetDays = 0) {
 }
 
 async function getPriceHistory(symbol, fromDate, toDate, days) {
-  // Yahoo Finance: .NS for India, no suffix for US
   const US_SYMBOLS = new Set(['NET','CEG','GLNG','NVDA','MSFT','AAPL','GOOGL','META','AMZN',
     'TSLA','AMD','AVGO','INTC','QCOM','MU','ASML','TSM','ARM','MRVL','CRM','NOW','SNOW',
     'DDOG','PANW','ZS','PLTR','ADBE','ORCL','WDAY','INTU','JPM','GS','MS','BAC','V','MA',
@@ -139,80 +138,89 @@ async function getPriceHistory(symbol, fromDate, toDate, days) {
     'COST','MCD','NKE','SBUX','DIS','NFLX','LMT','RTX','NOC','GD','HII','GE','CAT','HON',
     'UPS','FDX','XOM','CVX','COP','SLB','NEE','VST','LNG','SPY','QQQ','GLD','SOXX','EEM',
     'INDA','INFY','HDB','RDY']);
-  const yahooSymbol = symbol.includes('.') ? symbol 
-    : symbol.startsWith('^') ? symbol
-    : US_SYMBOLS.has(symbol) ? symbol 
+
+  const yahooSymbol = symbol.includes('.')  ? symbol
+    : symbol.startsWith('^')                ? symbol
+    : US_SYMBOLS.has(symbol)               ? symbol
     : `${symbol}.NS`;
-  
+
   const fetchDays = days || 365;
   const toTs   = Math.floor(Date.now() / 1000);
   const fromTs = toTs - (fetchDays * 24 * 3600);
-  
+
   return new Promise((resolve) => {
-    const https   = require('https');
-    const options = {
+    const https = require('https');
+    const zlib  = require('zlib');
+
+    const req = https.get({
       hostname: 'query1.finance.yahoo.com',
-      path:     `/v8/finance/chart/${yahooSymbol}?interval=1d&period1=${fromTs}&period2=${toTs}`,
-      method:   'GET',
+      path:     `/v8/finance/chart/${yahooSymbol}?interval=1d&period1=${fromTs}&period2=${toTs}&events=history`,
       headers: {
-        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept':          'application/json,text/plain,*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Origin':          'https://finance.yahoo.com',
-        'Referer':         'https://finance.yahoo.com/',
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept':          'application/json',
+        'Accept-Encoding': 'gzip',
       },
       timeout: 20000,
-    };
-    
-    const req = https.request(options, res => {
-      const chunks = [];
+    }, (res) => {
+      const buffers = [];
+
+      // Decompress if needed
       let stream = res;
-      const enc = res.headers['content-encoding'];
-      if (enc === 'gzip' || enc === 'br') {
-        const zlib = require('zlib');
-        stream = enc === 'gzip' ? res.pipe(zlib.createGunzip()) : res.pipe(zlib.createBrotliDecompress());
+      if (res.headers['content-encoding'] === 'gzip') {
+        stream = res.pipe(zlib.createGunzip());
       }
-      stream.on('data', c => chunks.push(c));
+
+      stream.on('data', chunk => buffers.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      stream.on('error', () => resolve(null));
       stream.on('end', () => {
         try {
-          const raw = Buffer.concat(chunks).toString();
-          // Debug first 3 stocks
-          if (raw.length < 300 || raw.includes('"No data"') || raw.includes('"error"')) {
-            console.log(`  Yahoo ${yahooSymbol}: status=${res.statusCode} body="${raw.slice(0,120)}"`);
+          const raw    = Buffer.concat(buffers).toString('utf8');
+          const parsed = JSON.parse(raw);
+          const result = parsed?.chart?.result?.[0];
+
+          if (!result) {
+            console.log(`  Yahoo ${yahooSymbol}: no result — ${raw.slice(0, 80)}`);
+            resolve(null);
+            return;
           }
-          const data       = JSON.parse(raw);
-          const result     = data?.chart?.result?.[0];
-          if (!result) { resolve(null); return; }
-          
+
           const timestamps = result.timestamp || [];
-          const quotes     = result.indicators?.quote?.[0] || {};
-          const closes     = quotes.close  || [];
-          const highs      = quotes.high   || [];
-          const lows       = quotes.low    || [];
-          const volumes    = quotes.volume || [];
-          
-          const history = timestamps.map((ts, i) => ({
-            date:  new Date(ts * 1000).toISOString().slice(0, 10),
-            close: closes[i]  ? parseFloat(closes[i].toFixed(2))  : 0,
-            high:  highs[i]   ? parseFloat(highs[i].toFixed(2))   : 0,
-            low:   lows[i]    ? parseFloat(lows[i].toFixed(2))    : 0,
-            vol:   volumes[i] || 0,
-          })).filter(d => d.close > 0);
-          
-          resolve(history.length >= 30 ? history : null);
+          const quote      = result.indicators?.quote?.[0] || {};
+          const closes     = quote.close  || [];
+          const highs      = quote.high   || [];
+          const lows       = quote.low    || [];
+          const volumes    = quote.volume || [];
+
+          const history = timestamps
+            .map((ts, i) => ({
+              date:  new Date(ts * 1000).toISOString().slice(0, 10),
+              close: closes[i]  != null ? parseFloat(closes[i].toFixed(2))  : 0,
+              high:  highs[i]   != null ? parseFloat(highs[i].toFixed(2))   : 0,
+              low:   lows[i]    != null ? parseFloat(lows[i].toFixed(2))    : 0,
+              vol:   volumes[i] || 0,
+            }))
+            .filter(d => d.close > 0);
+
+          if (history.length < 10) {
+            console.log(`  Yahoo ${yahooSymbol}: only ${history.length} valid bars`);
+            resolve(null);
+            return;
+          }
+
+          resolve(history);
         } catch(e) {
+          console.log(`  Yahoo ${yahooSymbol}: parse error — ${e.message}`);
           resolve(null);
         }
       });
     });
-    req.on('error', () => resolve(null));
+
+    req.on('error',   () => resolve(null));
     req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.end();
   });
 }
 
-// ── CURRENT QUOTE (single stock) ─────────────────────────────
+
 async function getQuote(symbol) {
   const r = await fetchNSE(`/api/quote-equity?symbol=${encodeURIComponent(symbol)}`);
   if (!r.ok) return null;
