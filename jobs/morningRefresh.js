@@ -108,7 +108,7 @@ async function runMorningRefresh() {
 
   // ── 4. FETCH FII DATA ─────────────────────────────────────
   try {
-    const fii = await nse.getFIIData();
+    const fii = await nse.getFII();
     if (fii) {
       snap.fii = fii;
       snap.success.push('fii:ok');
@@ -155,7 +155,7 @@ async function runMorningRefresh() {
 
   // ── 7. FETCH GAINERS / LOSERS ─────────────────────────────
   try {
-    const movers = await nse.getTopMovers();
+    const movers = await nse.getMovers().catch(() => null);
     if (movers) { snap.gainers = movers.gainers; snap.losers = movers.losers; }
   } catch(e) { /* optional */ }
 
@@ -272,7 +272,7 @@ async function runMiddayUpdate() {
   try {
     const prevSnap = await fb.getLatestSnapshot();
     const macro    = await nse.getMacro();
-    const fii      = await nse.getFIIData();
+    const fii      = await nse.getFII();
     const indices  = await nse.getIndices();
 
     const snap = {

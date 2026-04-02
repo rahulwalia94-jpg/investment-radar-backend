@@ -66,7 +66,8 @@ async function runWeeklyRecalibration() {
   console.log('\n[1/5] Fetching Nifty 500 list...');
   let nifty500 = [];
   try {
-    nifty500 = await nse.getNifty500List();
+    const raw500 = await nse.getNifty500List();
+    nifty500 = Array.isArray(raw500) ? raw500 : Object.values(raw500 || {});
     console.log(`Nifty 500: ${nifty500.length} stocks`);
     await fb.saveUniverse({ nifty500 });
   } catch(e) {
@@ -84,7 +85,7 @@ async function runWeeklyRecalibration() {
   console.log('\n[2/5] Classifying regimes from Nifty 50 history...');
   let regimePeriods = {};
   try {
-    const niftyHist = await stooq.getPriceHistory('NIFTY 50', null, null, 365);
+    const niftyHist = await stooq.getPriceHistory('^NSEI', null, null, 365);
     if (niftyHist && niftyHist.length >= 60) {
       regimePeriods = classifyRegimePeriods(niftyHist);
     } else {

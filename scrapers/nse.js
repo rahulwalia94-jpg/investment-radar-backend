@@ -154,18 +154,33 @@ async function getPriceHistory(symbol, fromDate, toDate, days) {
       path:     `/v8/finance/chart/${yahooSymbol}?interval=1d&period1=${fromTs}&period2=${toTs}`,
       method:   'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept':     'application/json',
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept':          'application/json,text/plain,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Origin':          'https://finance.yahoo.com',
+        'Referer':         'https://finance.yahoo.com/',
       },
-      timeout: 15000,
+      timeout: 20000,
     };
     
     const req = https.request(options, res => {
       const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => {
+      let stream = res;
+      const enc = res.headers['content-encoding'];
+      if (enc === 'gzip' || enc === 'br') {
+        const zlib = require('zlib');
+        stream = enc === 'gzip' ? res.pipe(zlib.createGunzip()) : res.pipe(zlib.createBrotliDecompress());
+      }
+      stream.on('data', c => chunks.push(c));
+      stream.on('end', () => {
         try {
-          const data       = JSON.parse(Buffer.concat(chunks).toString());
+          const raw = Buffer.concat(chunks).toString();
+          // Debug first 3 stocks
+          if (raw.length < 300 || raw.includes('"No data"') || raw.includes('"error"')) {
+            console.log(`  Yahoo ${yahooSymbol}: status=${res.statusCode} body="${raw.slice(0,120)}"`);
+          }
+          const data       = JSON.parse(raw);
           const result     = data?.chart?.result?.[0];
           if (!result) { resolve(null); return; }
           
