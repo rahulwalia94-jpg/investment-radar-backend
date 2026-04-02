@@ -140,6 +140,7 @@ async function getPriceHistory(symbol, fromDate, toDate, days) {
     'UPS','FDX','XOM','CVX','COP','SLB','NEE','VST','LNG','SPY','QQQ','GLD','SOXX','EEM',
     'INDA','INFY','HDB','RDY']);
   const yahooSymbol = symbol.includes('.') ? symbol 
+    : symbol.startsWith('^') ? symbol
     : US_SYMBOLS.has(symbol) ? symbol 
     : `${symbol}.NS`;
   
