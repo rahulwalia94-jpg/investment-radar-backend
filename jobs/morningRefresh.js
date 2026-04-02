@@ -166,18 +166,20 @@ async function runMorningRefresh() {
     newsData = await fb.getLatestNews() || newsData;
   } catch(e) { snap.errors.push('news:' + e.message.slice(0,30)); }
 
-  // ── 9. LOAD PRICE HISTORIES ───────────────────────────────
+  // ── 9. LOAD PRICE HISTORIES (stored separately in B2) ───────
   console.log('Loading price histories from B2...');
-  const priceHistories = {};
+  let priceHistories = {};
   try {
-    // Price histories are stored inside instrument objects
-    Object.entries(instruments).forEach(([sym, inst]) => {
-      if (inst._price_history?.length > 0) {
-        priceHistories[sym] = inst._price_history;
-      }
-    });
+    priceHistories = await fb.getAllPriceHistories();
     console.log(`Price histories loaded: ${Object.keys(priceHistories).length} stocks`);
-  } catch(e) { snap.errors.push('history:' + e.message.slice(0,30)); }
+    if (Object.keys(priceHistories).length === 0) {
+      console.log('No price histories found — recalibration needed');
+      snap.errors.push('no_price_history');
+    }
+  } catch(e) {
+    console.log('Price history load error:', e.message);
+    snap.errors.push('history:' + e.message.slice(0,30));
+  }
 
   // ── 10. LOAD REGIME PERIODS ───────────────────────────────
   let regimePeriods = {};

@@ -63,6 +63,32 @@ async function bulkSaveInstruments(instruments) {
   console.log(`Bulk saved ${Object.keys(instruments).length} instruments to B2`);
 }
 
+// ── PRICE HISTORY (stored separately from instruments) ───────
+async function savePriceHistories(histories) {
+  // Save in chunks of 50 stocks to keep files small
+  const symbols = Object.keys(histories);
+  const CHUNK   = 50;
+  for (let i = 0; i < symbols.length; i += CHUNK) {
+    const chunk = {};
+    symbols.slice(i, i+CHUNK).forEach(sym => { chunk[sym] = histories[sym]; });
+    await storage.save(`price_history_${Math.floor(i/CHUNK)}.json`, chunk);
+  }
+  // Save index of how many chunks
+  await storage.save('price_history_index.json', { chunks: Math.ceil(symbols.length/CHUNK), count: symbols.length, updated_at: new Date().toISOString() });
+  console.log(`Price histories saved: ${symbols.length} stocks in ${Math.ceil(symbols.length/CHUNK)} chunks`);
+}
+
+async function getAllPriceHistories() {
+  const idx = await storage.load('price_history_index.json');
+  if (!idx || !idx.chunks) return {};
+  const all = {};
+  for (let i = 0; i < idx.chunks; i++) {
+    const chunk = await storage.load(`price_history_${i}.json`) || {};
+    Object.assign(all, chunk);
+  }
+  return all;
+}
+
 // ── UNIVERSE LISTS ────────────────────────────────────────────
 async function getUniverse(list = 'nifty500') {
   const ckey = `universe_${list}`;
@@ -245,6 +271,7 @@ function init() { return {}; }
 module.exports = {
   init,
   getAllInstruments, getInstrument, saveInstrument, bulkSaveInstruments,
+  savePriceHistories, getAllPriceHistories,
   getUniverse, saveUniverse,
   saveSnapshot, getLatestSnapshot,
   saveAIAnalysis, getLatestAIAnalysis,

@@ -201,13 +201,26 @@ async function runWeeklyRecalibration() {
 
   // Save calibration run metadata
   const elapsed = Math.round((Date.now() - startTime) / 1000);
+  // Save price histories SEPARATELY (not inside instruments.json)
+  if (Object.keys(priceHistories).length > 0) {
+    console.log(`Saving ${Object.keys(priceHistories).length} price histories to B2...`);
+    await fb.savePriceHistories(priceHistories);
+  }
+
+  // Strip _price_history from instruments before saving (keep instruments.json small)
+  const cleanInstruments = {};
+  Object.entries({ ...calibrated, ...usInstruments }).forEach(([sym, inst]) => {
+    const { _price_history, ...clean } = inst;
+    cleanInstruments[sym] = clean;
+  });
+
   await fb.saveCalibrationRun({
     total:     nifty500.length + Object.keys(US_UNIVERSE||{}).length,
     calibrated:stats.calibrated,
     skipped:   stats.skipped.length,
     errors:    stats.errors.length,
     elapsed,
-    instruments: { ...calibrated, ...usInstruments },
+    instruments: cleanInstruments,
     regime_periods: regimePeriods,
     completed_at: new Date().toISOString(),
   });
