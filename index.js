@@ -408,6 +408,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ── TEST YAHOO FINANCE ───────────────────────────────────
+    if (pathname === '/api/test-yahoo') {
+      const nse    = require('./scrapers/nse');
+      const syms   = ['TCS', 'RELIANCE', 'HDFCBANK', 'NET', 'CEG', '^NSEI'];
+      const results = {};
+      for (const sym of syms) {
+        try {
+          const h = await nse.getPriceHistory(sym, null, null, 14);
+          results[sym] = h ? `✅ ${h.length} bars, last=${h[h.length-1]?.close}` : '❌ NULL';
+        } catch(e) {
+          results[sym] = `❌ ERROR: ${e.message}`;
+        }
+      }
+      send(res, { ok: true, results, ts: new Date().toISOString() });
+      return;
+    }
+
     send(res, { error: 'Not found', endpoints: ['/health','/api/snapshot','/api/opportunities','/api/portfolio','/api/stats','/api/calibration','/api/refresh','/api/preferences','/webhook/telegram'] }, 404);
 
   } catch (e) {
