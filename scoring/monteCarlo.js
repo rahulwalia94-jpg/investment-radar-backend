@@ -106,15 +106,20 @@ function simulatePortfolio(holdings, covMatrix, symbols, expectedReturns, days =
     s + weights.reduce((s2,wj,j) => s2 + wi*wj*covMatrix[i][j], 0), 0
   );
   const portSigma    = Math.sqrt(portVariance * 252);
-  const marginalRisk = symbols.map((sym,i) => {
-    const mcr = weights.reduce((s,wj,j) => s + wj*covMatrix[i][j], 0);
+  const marginalRisk = portSigma > 0.001 ? symbols.map((sym,i) => {
+    const mcr = weights.reduce((s,wj,j) => s + wj*(covMatrix[i]?.[j]||0), 0);
     return {
-      symbol:     sym,
-      weight:     parseFloat((weights[i]*100).toFixed(1)),
-      marginal_risk: parseFloat((mcr/portSigma*100).toFixed(2)),
-      contribution:  parseFloat((weights[i]*mcr/portSigma*100).toFixed(2)),
+      symbol:        sym,
+      weight:        parseFloat((weights[i]*100).toFixed(1)),
+      marginal_risk: parseFloat((mcr/(portSigma+1e-10)*100).toFixed(2)),
+      contribution:  parseFloat((weights[i]*mcr/(portSigma+1e-10)*100).toFixed(2)),
     };
-  });
+  }) : symbols.map((sym,i) => ({
+    symbol: sym,
+    weight: parseFloat((weights[i]*100).toFixed(1)),
+    marginal_risk: 0,
+    contribution: 0,
+  }));
 
   return {
     current_value:   parseFloat(totalValue.toFixed(2)),

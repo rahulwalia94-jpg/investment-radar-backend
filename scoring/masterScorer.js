@@ -16,7 +16,7 @@ const { computeNewsSignal, computeGlobalGeoSignal } = require('./newsSignal');
 const { computeMacroScore, getSectorMacroAdjustment } = require('./macroSignal');
 const { computeFundamentalScore } = require('./fundamentals');
 const { computeFactorScore, computeFactors } = require('./factorModel');
-const { estimateDCC }             = require('./dccModel');
+// dccModel used via morningRefresh (pre-computed matrix)
 
 // ── REGIME-BASED SECTOR MATRIX ────────────────────────────────
 const REGIME_MATRIX = {
@@ -101,9 +101,8 @@ let _factors = null;
 let _dccResult= null;
 
 function initModels(instruments, priceHistories) {
-  _factors   = computeFactors(instruments, priceHistories);
-  const syms = Object.keys(instruments).slice(0, 50); // top 50 for DCC
-  _dccResult = estimateDCC(syms, priceHistories);
+  _factors = computeFactors(instruments, priceHistories);
+  // DCC handled externally via morningRefresh (pre-computed matrix from B2)
 }
 
 // ── MASTER SCORE ──────────────────────────────────────────────

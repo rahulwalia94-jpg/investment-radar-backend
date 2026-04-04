@@ -403,16 +403,21 @@ async function runMorningRefresh() {
 
     // ── Step 5: Factor Model enrichment ───────────────────────
     try {
-      const marketHistory = priceHistories['^NSEI'] || priceHistories['%5ENSEI'] || [];
+      const marketHistory = priceHistories['^NSEI'] ||
+                           priceHistories['%5ENSEI'] ||
+                           priceHistories['NIFTY50'] ||
+                           priceHistories['^NSEBANK'] || [];
       let factorCount = 0;
       const portSyms  = ['NET','CEG','GLNG'];
       portSyms.forEach(sym => {
-        const hist  = priceHistories[sym] || [];
-        const score = scoringResult?.scores?.[sym];
-        if (!score || hist.length < 60) return;
-        const factor = computeFactorScore(sym, hist, marketHistory, fundamentalsData?.[sym]);
-        score.factor_detail = factor;
-        factorCount++;
+        try {
+          const hist  = priceHistories[sym] || [];
+          const score = scoringResult?.scores?.[sym];
+          if (!score || !hist || hist.length < 60) return;
+          const mktHist = marketHistory && marketHistory.length > 0 ? marketHistory : null;
+          const factor  = computeFactorScore(sym, hist, mktHist, fundamentalsData?.[sym] || null);
+          if (factor) { score.factor_detail = factor; factorCount++; }
+        } catch(fe) { console.log(`Factor ${sym}:`, fe.message); }
       });
       if (factorCount > 0) console.log(`Factor model: enriched ${factorCount} portfolio stocks`);
 

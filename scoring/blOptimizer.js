@@ -229,7 +229,10 @@ function runBlackLitterman(params) {
         sharpe_ratio:    parseFloat(portSharpe.toFixed(3)),
       },
       cash_deployment:   deployment,
-      top_pick:          deployment?.recommendations?.[0]?.symbol || null,
+      top_pick: (()=>{
+        const weights = symbols.reduce((obj,sym,i) => ({...obj,[sym]:optWeights[i]}),{});
+        return Object.entries(weights).sort(([,a],[,b])=>b-a)[0]?.[0] || null;
+      })(),
       regime,
       generated_at:      new Date().toISOString(),
     };
