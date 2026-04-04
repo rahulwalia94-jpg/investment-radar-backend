@@ -1,253 +1,290 @@
-// ── MASTER SCORER v2 ──────────────────────────────────────────
-// Combines all 6 models:
-//   1. GARCH(1,1)          — volatility, sigma, Sharpe
-//   2. News Sentiment      — FinBERT-style via Haiku
-//   3. Fundamentals        — PE, ROE, D/E
-//   4. Macro Signals       — FII, VIX, oil, USD/INR
-//   5. Geopolitical        — Trump, Iran, RBI, OPEC
-//   6. Factor Model        — alpha, beta, SMB, HML
-//
-// Weights: Quant 25% | News 20% | Fundamental 20% | Macro 15% | Geo 10% | Factor 10%
-
+// ═══════════════════════════════════════════════════════════════
+// MASTER SCORER v2 — Orchestrates all 6 layers
+// ALL async. Returns ScoringResult (see SCHEMA.js)
+// Weights: quant30 news20 fund15 macro15 geo10 factor10
+// ═══════════════════════════════════════════════════════════════
 'use strict';
 
-const { computeQuantScore }       = require('./garchEngine');
-const { computeNewsSignal, computeGlobalGeoSignal } = require('./newsSignal');
-const { computeMacroScore, getSectorMacroAdjustment } = require('./macroSignal');
-const { computeFundamentalScore } = require('./fundamentals');
-const { computeFactorScore, computeFactors } = require('./factorModel');
-// dccModel used via morningRefresh (pre-computed matrix)
+const garch    = require('./garchEngine');
+const news     = require('./newsSignal');
+const macro    = require('./macroSignal');
+const fund     = require('./fundamentals');
+const factor   = require('./factorModel');
+const dcc      = require('./dccModel');
+const mc       = require('./monteCarlo');
+const bl       = require('./blOptimizer');
 
-// ── REGIME-BASED SECTOR MATRIX ────────────────────────────────
-const REGIME_MATRIX = {
-  BEAR: {
-    winners:    ['Defence','Pharma','FMCG','IT','Gold','Utilities'],
-    losers:     ['Realty','NBFC','Auto','Aviation','Consumer'],
-    US_winners: ['CEG','NET','PLTR','LMT','RTX','GLD','TLT','WMT','COST','JNJ','UNH'],
-    US_losers:  ['TSLA','META','ARKK','SNAP','high_beta_growth'],
-  },
-  SOFT_BEAR: {
-    winners:    ['IT','Pharma','FMCG','Defence'],
-    losers:     ['Realty','NBFC','Aviation'],
-    US_winners: ['MSFT','GOOGL','AAPL','NET','CEG','GLD','TLT'],
-    US_losers:  ['TSLA','small_growth'],
-  },
-  SIDEWAYS: {
-    winners:    ['IT','Banking','FMCG'],
-    losers:     [],
-    US_winners: [],
-    US_losers:  [],
-  },
-  SOFT_BULL: {
-    winners:    ['Banking','Auto','Realty','NBFC','Consumer'],
-    losers:     ['Gold','Bonds'],
-    US_winners: ['NVDA','AMD','NET','MSFT','JPM','AMZN'],
-    US_losers:  ['GLD','TLT'],
-  },
-  BULL: {
-    winners:    ['Banking','Auto','Realty','Consumer','Metals','Defence'],
-    losers:     ['Gold','Bonds','defensive'],
-    US_winners: ['NVDA','AMD','MSFT','AAPL','META','AMZN','TSLA'],
-    US_losers:  ['GLD','TLT'],
-  },
-};
+const WEIGHTS = { quant:0.30, news:0.20, fundamental:0.15, macro:0.15, geo:0.10, factor:0.10 };
 
-function getRegimeAdj(sym, sector, regime) {
-  const m = REGIME_MATRIX[regime];
-  if (!m) return 0;
-  if (m.US_winners?.includes(sym))  return +10;
-  if (m.US_losers?.includes(sym))   return -10;
-  if (!sector) return 0;
-  const isWinner = m.winners?.some(w => sector.includes(w));
-  const isLoser  = m.losers?.some(l => sector.includes(l));
-  if (isWinner) return +8;
-  if (isLoser)  return -8;
+const BEAR_BOOST  = new Set(['Defence','Pharma','FMCG','Telecom','GLD','TLT','IEF','CEG','NET']);
+const BEAR_SECTOR = { Defence:+10, Pharma:+8, FMCG:+6, Power:+5, Telecom:+4 };
+const BULL_SECTOR = { Banking:+8, Auto:+8, Realty:+6, Metals:+6, NBFC:+5 };
+
+function regimeAdj(symbol, sector, regime) {
+  if (BEAR_BOOST.has(symbol)) return regime==='BEAR'||regime==='SOFT_BEAR' ? +8 : 0;
+  const map = regime==='BEAR'||regime==='SOFT_BEAR' ? BEAR_SECTOR : regime==='BULL'||regime==='SOFT_BULL' ? BULL_SECTOR : {};
+  for (const [sec, adj] of Object.entries(map)) {
+    if ((sector||'').includes(sec)) return adj;
+  }
   return 0;
 }
 
-function scoreToSignal(score, regime) {
-  const thresholds = (regime === 'BEAR' || regime === 'SOFT_BEAR')
-    ? { strong_buy:72, buy:62, hold:48, reduce:35 }
-    : { strong_buy:78, buy:65, hold:50, reduce:35 };
-  if (score >= thresholds.strong_buy) return 'STRONG BUY';
-  if (score >= thresholds.buy)        return 'BUY';
-  if (score >= thresholds.hold)       return 'HOLD';
-  if (score >= thresholds.reduce)     return 'REDUCE';
+function toSignal(score, regime) {
+  const bear = regime==='BEAR'||regime==='SOFT_BEAR';
+  if (score >= (bear?72:78)) return 'STRONG BUY';
+  if (score >= (bear?62:65)) return 'BUY';
+  if (score >= (bear?48:50)) return 'HOLD';
+  if (score >= 35)           return 'REDUCE';
   return 'AVOID';
 }
 
-function buildReason(sym, layers, regime, geoFlags) {
-  const parts = [];
-  const q = layers.quant?.components;
-  const f = layers.factor;
-  if (q?.sharpe > 1.5)      parts.push(`Sharpe ${q.sharpe.toFixed(1)}`);
-  if (q?.momentum > 10)     parts.push(`+${q.momentum.toFixed(0)}% momentum`);
-  if (q?.momentum < -10)    parts.push(`${q.momentum.toFixed(0)}% drawdown`);
-  if (f?.alpha_annual > 3)  parts.push(`Alpha +${f.alpha_annual.toFixed(1)}%`);
-  if (f?.alpha_annual < -3) parts.push(`Alpha ${f.alpha_annual.toFixed(1)}%`);
-  if (geoFlags?.length > 0) {
-    geoFlags.forEach(fl => {
-      if (fl.impact > 5)  parts.push(`+${fl.flag.replace(/_/g,' ')}`);
-      if (fl.impact < -5) parts.push(`Risk: ${fl.flag.replace(/_/g,' ')}`);
-    });
-  }
-  const m = REGIME_MATRIX[regime];
-  if (m?.US_winners?.includes(sym)) parts.push(`Defensive in ${regime}`);
-  return parts.slice(0, 4).join(' · ') || `${regime} regime dynamics`;
-}
-
-// ── PRE-COMPUTE FACTORS (once per scoring run) ────────────────
-let _factors = null;
-let _dccResult= null;
-
-function initModels(instruments, priceHistories) {
-  _factors = computeFactors(instruments, priceHistories);
-  // DCC handled externally via morningRefresh (pre-computed matrix from B2)
-}
-
-// ── MASTER SCORE ──────────────────────────────────────────────
-function computeMasterScore(instrument, snap, newsData, priceHistory, regimePeriods, fundamentalsData) {
+// ── SCORE ONE INSTRUMENT (async) ──────────────────────────────
+async function scoreOne(instrument, snap, newsData, history, marketHistory, regimePeriods, fundamentalsData) {
   const sym    = instrument.symbol || instrument.nse || '';
   const sector = instrument.sector || '';
   const regime = snap?.regime || 'SIDEWAYS';
-  const isUS   = instrument.country === 'US';
 
-  // ── Layer 1: QUANT (GARCH) 25% ────────────────────────────
-  const history     = priceHistory || instrument._price_history || [];
-  const quantResult = computeQuantScore(history, regime, regimePeriods || {});
+  // Layer 1: GARCH (sync)
+  const garchResult = garch.computeStock(history || [], regimePeriods || {});
+  const quantSc     = garch.quantScore(garchResult, regime);
 
-  // ── Layer 2: NEWS 20% ─────────────────────────────────────
-  const stockNews   = newsData?.stocks?.[sym]?.items || [];
-  const newsResult  = computeNewsSignal(sym, sector, stockNews);
+  // Layer 2: News (async — MUST await)
+  const stockItems  = newsData?.stocks?.[sym]?.items || [];
+  const newsResult  = await news.score(sym, sector, stockItems);
 
-  // ── Layer 3: FUNDAMENTAL 20% ──────────────────────────────
-  const fundData    = fundamentalsData?.[sym] || null;
-  const instWithFund= fundData ? { ...instrument, valuation: fundData } : instrument;
-  const fundResult  = computeFundamentalScore(instWithFund, regime, newsResult);
+  // Layer 3: Fundamentals (sync)
+  const fundData    = fundamentalsData?.[sym] || instrument.fundamentals || null;
+  const fundResult  = fund.score(fundData, sector, regime);
 
-  // ── Layer 4: MACRO 15% ────────────────────────────────────
-  const globalNews  = (newsData?.market || []).concat(
-    Object.values(newsData?.stocks || {}).flatMap(s => s.items || []).slice(0,20));
-  const newsText    = globalNews.map(n=>`${n.title} ${n.summary||''}`).join(' ');
-  const macroResult = computeMacroScore(snap, newsText);
-  const macroAdj    = getSectorMacroAdjustment(sector, macroResult);
+  // Layer 4: Macro (sync)
+  const macroResult = macro.score(snap);
+  const macroAdj    = macro.sectorAdj(sector, macroResult);
   const macroScore  = Math.max(0, Math.min(100, macroResult.score + macroAdj));
 
-  // ── Layer 5: GEO 10% ──────────────────────────────────────
+  // Layer 5: Geo (from news flags)
   const geoFlags    = newsResult.flags || [];
-  const geoScore    = Math.max(0, Math.min(100,
-    50 + geoFlags.reduce((s,f) => s + (f.impact||0), 0)));
+  const geoScore    = Math.max(0, Math.min(100, 50 + geoFlags.reduce((s, f) => s + (f.impact||0), 0)));
 
-  // ── Layer 6: FACTOR MODEL 10% ────────────────────────────
-  let factorResult  = { factor_score: 50, source: 'no_data' };
-  if (_factors && history.length >= 60) {
-    try {
-      factorResult = computeFactorScore(sym, history, _factors, isUS);
-    } catch(e) { /* keep default */ }
-  }
+  // Layer 6: Factor (sync, never crashes)
+  const factorResult= factor.compute(sym, history || [], marketHistory || null);
 
-  // ── REGIME ADJUSTMENT ────────────────────────────────────
-  const regimeAdj = getRegimeAdj(sym, sector, regime);
-
-  // ── WEIGHTED COMBINATION ─────────────────────────────────
-  const WEIGHTS = { quant:0.30, news:0.20, fundamental:0.15, macro:0.15, geo:0.10, factor:0.10 };
-
-  const rawScore =
-    quantResult.score         * WEIGHTS.quant       +
-    newsResult.score          * WEIGHTS.news        +
-    fundResult.score          * WEIGHTS.fundamental +
-    macroScore                * WEIGHTS.macro       +
-    geoScore                  * WEIGHTS.geo         +
+  // Weighted score — all values guaranteed numbers
+  const raw =
+    quantSc              * WEIGHTS.quant       +
+    newsResult.score     * WEIGHTS.news        +
+    fundResult.score     * WEIGHTS.fundamental +
+    macroScore           * WEIGHTS.macro       +
+    geoScore             * WEIGHTS.geo         +
     factorResult.factor_score * WEIGHTS.factor;
 
-  const finalScore = Math.max(0, Math.min(100, Math.round(rawScore + regimeAdj)));
-  const signal     = scoreToSignal(finalScore, regime);
+  const adj        = regimeAdj(sym, sector, regime);
+  const finalScore = Math.round(Math.max(0, Math.min(100, raw + adj)));
+
+  // Validate — should never be NaN
+  if (isNaN(finalScore)) {
+    console.error(`NaN score for ${sym}: quant=${quantSc} news=${newsResult.score} fund=${fundResult.score} macro=${macroScore} geo=${geoScore} factor=${factorResult.factor_score}`);
+    return { symbol:sym, score:50, signal:'HOLD', reason:'scoring error', sector, country:instrument.country||'IN',
+      layers:{}, calibration:garchResult, last_price:instrument.last_price||0 };
+  }
 
   const layers = {
-    quant:       { score: quantResult.score,          weight: 25, ...quantResult },
-    news:        { score: newsResult.score,            weight: 20, ...newsResult  },
-    fundamental: { score: fundResult.score,            weight: 20, ...fundResult  },
-    macro:       { score: macroScore,                  weight: 15, adj: macroAdj  },
-    geo:         { score: geoScore,                    weight: 10, flags: geoFlags},
-    factor:      { score: factorResult.factor_score,   weight: 10, ...factorResult},
+    quant:       { score:quantSc,              weight:30, ...garchResult, source:garchResult.source },
+    news:        { score:newsResult.score,     weight:20, ...newsResult },
+    fundamental: { score:fundResult.score,     weight:15, ...fundResult },
+    macro:       { score:macroScore,           weight:15, ...macroResult, sector_adj:macroAdj },
+    geo:         { score:geoScore,             weight:10, flags:geoFlags },
+    factor:      { score:factorResult.factor_score, weight:10, ...factorResult },
   };
 
-  // Calibration for BL / Monte Carlo
-  const calibration = quantResult.calibration || {
-    sigma:        { BULL:0.22, SOFT_BULL:0.26, SIDEWAYS:0.20, SOFT_BEAR:0.30, BEAR:0.42 },
-    base_returns: { BULL:20,   SOFT_BULL:10,   SIDEWAYS:3,    SOFT_BEAR:-5,   BEAR:-15  },
-    source:       history.length >= 60 ? 'calculated' : 'fallback',
-    history_days: history.length,
-  };
+  const reason = [
+    garchResult.sharpe > 1.0 && `Sharpe ${garchResult.sharpe.toFixed(1)}`,
+    garchResult.momentum_12m > 10 && `Mom ${garchResult.momentum_12m.toFixed(0)}%`,
+    geoFlags.length > 0 && geoFlags.map(f => f.flag.replace(/_/g,' ')).join(', '),
+    factorResult.alpha > 2 && `Alpha ${factorResult.alpha.toFixed(1)}%/yr`,
+  ].filter(Boolean).slice(0, 2).join('. ') || `${regime} regime`;
 
   return {
-    symbol:      sym,
-    score:       finalScore,
-    signal,
-    reason:      buildReason(sym, layers, regime, geoFlags),
+    symbol:     sym,
+    score:      finalScore,
+    signal:     toSignal(finalScore, regime),
+    reason,
     sector,
-    country:     instrument.country || 'IN',
+    country:    instrument.country || 'IN',
+    last_price: instrument.last_price || history?.[history.length-1]?.close || 0,
     layers,
-    calibration,
-    last_price:  instrument.last_price || 0,
-    market_cap:  instrument.market_cap || fundData?.market_cap || null,
-    scored_at:   new Date().toISOString(),
+    calibration: garchResult,  // also at top level for legacy compat
+    scored_at:  new Date().toISOString(),
   };
 }
 
-// ── SCORE ALL ─────────────────────────────────────────────────
-async function scoreAllInstruments(instruments, snap, newsData, priceHistories, regimePeriods, fundamentalsData) {
-  const results = {};
+// ── SCORE ALL INSTRUMENTS ─────────────────────────────────────
+async function scoreAll(instruments, snap, newsData, priceHistories, regimePeriods, fundamentalsData, corrMatrixData) {
   const symbols = Object.keys(instruments);
+  const regime  = snap?.regime || 'SIDEWAYS';
+  const results = {};
 
-  console.log(`Scoring ${symbols.length} instruments with 6-layer model...`);
+  // Market history for factor model
+  const marketHistory = priceHistories?.['^NSEI'] || priceHistories?.['^GSPC'] || priceHistories?.['SPY'] || null;
 
-  // Pre-compute factors
-  try { initModels(instruments, priceHistories); } catch(e) { console.log('Factor init error:', e.message); }
+  console.log(`Scoring ${symbols.length} instruments | regime: ${regime} | regimePeriods: ${Object.keys(regimePeriods||{}).length}`);
 
+  // Spot check regime matching
+  if (symbols.length > 0 && priceHistories) {
+    const s0   = symbols[0];
+    const h0   = priceHistories[s0] || [];
+    const hits = h0.filter(b => regimePeriods?.[b.date]).length;
+    console.log(`  Regime check ${s0}: ${hits}/${h0.length} bars tagged`);
+  }
+
+  // Score all instruments (sequential to avoid memory spikes)
   let done = 0;
   for (const sym of symbols) {
     const inst    = instruments[sym];
     const history = priceHistories?.[sym] || [];
     try {
-      results[sym] = computeMasterScore(inst, snap, newsData, history, regimePeriods, fundamentalsData);
+      results[sym] = await scoreOne(inst, snap, newsData, history, marketHistory, regimePeriods, fundamentalsData);
     } catch(e) {
-      results[sym] = {
-        symbol: sym, score:50, signal:'HOLD',
-        reason: 'Scoring error: ' + e.message?.slice(0,40),
-        sector: inst.sector||'', layers:{}, calibration: inst.calibration||{},
-        last_price: inst.last_price||0,
-      };
+      console.error(`Score error ${sym}:`, e.message);
+      results[sym] = { symbol:sym, score:50, signal:'HOLD', reason:`error: ${e.message.slice(0,30)}`,
+        sector:inst.sector||'', country:inst.country||'IN', layers:{}, calibration:{}, last_price:0 };
     }
     done++;
-    if (done % 50 === 0) console.log(`  Scored ${done}/${symbols.length}`);
+    if (done % 100 === 0) console.log(`  Scored ${done}/${symbols.length}`);
   }
 
-  const sorted  = Object.entries(results).sort(([,a],[,b]) => b.score - a.score);
-  const top5    = sorted.slice(0,5).map(([s])=>s);
-  const top20   = sorted.slice(0,20).map(([s])=>s);
-  const allNews = Object.values(newsData?.stocks||{}).flatMap(s=>s.items||[]);
-  const geoSigs = computeGlobalGeoSignal(allNews);
+  // Sort
+  const sorted = Object.entries(results).sort(([,a],[,b]) => b.score - a.score);
+  const top5   = sorted.slice(0, 5).map(([s]) => s);
+  const top20  = sorted.slice(0, 20).map(([s]) => s);
 
-  console.log(`Scoring complete. Top 5: ${top5.join(', ')}`);
+  // DCC — use pre-computed matrix or compute for top20
+  let dccResult = null;
+  try {
+    const portSyms = ['NET','CEG','GLNG'].filter(s => priceHistories?.[s]?.length >= 30);
+    const dccSyms  = [...new Set([...portSyms, ...top20.slice(0,15)])].filter(s => priceHistories?.[s]?.length >= 30);
 
-  // Build active geo flags
-  const activeGeoFlags = {};
+    let covData = null;
+    if (corrMatrixData?.symbols?.length > 0) {
+      covData = dcc.loadFromMatrix(corrMatrixData, dccSyms);
+    }
+    if (!covData) {
+      const sigmaMap = dccSyms.reduce((o, s) => ({ ...o, [s]: results[s]?.calibration?.sigma?.[regime] || 0.25 }), {});
+      covData = dcc.diagonalCov(dccSyms, sigmaMap);
+    }
+
+    dccResult = {
+      symbols:     dccSyms,
+      correlation: dcc.buildCorrObject(dccSyms, covData.corr),
+      covariance:  covData.cov,
+      sigmas:      dccSyms.reduce((o, s, i) => ({ ...o, [s]: parseFloat((covData.sigmas[i]*100).toFixed(1)) }), {}),
+      source:      corrMatrixData?.symbols?.length > 0 ? 'precomputed' : 'diagonal',
+      regime,
+    };
+
+    const portCorr = portSyms.map(a => portSyms.map(b => parseFloat((dccResult.correlation[a]?.[b]||0).toFixed(3))));
+    console.log('DCC:', portSyms.map((a,i) => portSyms.slice(i+1).map(b => `${a}-${b}: ${dccResult.correlation[a]?.[b]?.toFixed(3)}`)).flat().join(' | '));
+  } catch(e) {
+    console.error('DCC error:', e.message);
+  }
+
+  // Monte Carlo — always runs (uses DCC if available, diagonal if not)
+  let mcResults = {};
+  try {
+    const PORTFOLIO = [
+      { sym:'NET',  qty:1.066992, avgCost:208.62 },
+      { sym:'CEG',  qty:0.714253, avgCost:310.43 },
+      { sym:'GLNG', qty:3.489692, avgCost:50.93  },
+    ];
+    const usdInr = snap?.usdInr || 86;
+
+    for (const h of PORTFOLIO) {
+      const hist     = priceHistories?.[h.sym] || [];
+      const cal      = results[h.sym]?.calibration || {};
+      const lastPrice= hist[hist.length-1]?.close || snap?.usPrices?.[h.sym] || h.avgCost;
+      const sigma    = cal.sigma?.[regime] || 0.30;
+      const expRet   = cal.base_returns?.[regime] || 0;
+
+      mcResults[h.sym] = {
+        ...mc.simulatePaths({ currentPrice:lastPrice, expectedReturn:expRet, sigma, days:90, paths:10000, regime }),
+        avg_cost:    h.avgCost,
+        qty:         h.qty,
+        current_inr: Math.round(lastPrice * h.qty * usdInr),
+        pl_pct:      parseFloat(((lastPrice - h.avgCost) / h.avgCost * 100).toFixed(1)),
+      };
+    }
+
+    // Portfolio Cholesky
+    if (dccResult) {
+      const portSyms   = PORTFOLIO.map(h => h.sym).filter(s => dccResult.symbols.includes(s));
+      const portHoldings = PORTFOLIO.filter(h => portSyms.includes(h.sym)).map(h => {
+        const hist  = priceHistories?.[h.sym] || [];
+        const price = hist[hist.length-1]?.close || h.avgCost;
+        return { sym:h.sym, value:price * h.qty * usdInr };
+      });
+      const portIdx = portSyms.map(s => dccResult.symbols.indexOf(s));
+      const subCov  = portIdx.map(i => portIdx.map(j => dccResult.covariance?.[i]?.[j] || 0));
+      const expRets = portSyms.map(s => results[s]?.calibration?.base_returns?.[regime] || 0);
+
+      mcResults._portfolio = {
+        ...mc.simulatePortfolio(portHoldings, subCov, portSyms, expRets, 90, 10000),
+        cholesky_used: true,
+        usdInr,
+      };
+    }
+
+    console.log(`Monte Carlo: NET=${mcResults.NET?.win_probability}% CEG=${mcResults.CEG?.win_probability}% GLNG=${mcResults.GLNG?.win_probability}%`);
+  } catch(e) {
+    console.error('MC error:', e.message);
+  }
+
+  // Black-Litterman
+  let blResult = null;
+  try {
+    if (dccResult && top20.length >= 5) {
+      const blSyms = top20.filter(s => dccResult.symbols.includes(s)).slice(0, 15);
+      const blIdx  = blSyms.map(s => dccResult.symbols.indexOf(s));
+      const blCov  = blIdx.map(i => blIdx.map(j => dccResult.covariance?.[i]?.[j] || 0));
+
+      blResult = bl.run({
+        symbols:     blSyms,
+        covMatrix:   blCov,
+        scores:      results,
+        priceHistories,
+        regime,
+        holdings:    [{ sym:'NET' }, { sym:'CEG' }, { sym:'GLNG' }],
+      });
+      if (blResult) console.log(`BL: top_pick=${blResult.top_pick} sharpe=${blResult.portfolio_metrics?.sharpe_ratio}`);
+    }
+  } catch(e) {
+    console.error('BL error:', e.message);
+  }
+
+  // Geo flags summary
+  const activeFlags = {};
   Object.values(results).forEach(r => {
     (r.layers?.geo?.flags || []).forEach(f => {
-      if (!activeGeoFlags[f.flag]) activeGeoFlags[f.flag] = { ...f, count: 0 };
-      activeGeoFlags[f.flag].count++;
+      if (!activeFlags[f.flag]) activeFlags[f.flag] = { ...f, count:0 };
+      activeFlags[f.flag].count++;
     });
   });
+
+  // News stats
+  const newsCount   = Object.values(results).filter(r => (r.layers?.news?.articles||0) > 0).length;
+  const finbertCount= Object.values(results).filter(r => r.layers?.news?.source === 'finbert').length;
+  console.log(`News: ${newsCount} stocks scored | FinBERT: ${finbertCount}`);
+
+  console.log(`Scoring complete. Top 5: ${top5.join(', ')}`);
 
   return {
     scores:      results,
     top5, top20,
-    geo_signals: { ...(geoSigs||{}), active_flags: activeGeoFlags },
-    dcc:         _dccResult,
+    geo_signals: { active_flags: activeFlags },
+    dcc:         dccResult,
+    monte_carlo: mcResults,
+    bl_result:   blResult,
+    model:       'six-layer-v2',
     scored_at:   new Date().toISOString(),
-    model:       'six-layer-v1',
   };
 }
 
-module.exports = { computeMasterScore, scoreAllInstruments, scoreToSignal, initModels };
+module.exports = { scoreAll, scoreOne };
