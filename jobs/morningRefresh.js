@@ -218,30 +218,33 @@ async function runMorningRefresh() {
     regimePeriods = cal?.regime_periods || {};
 
     // Always rebuild from Nifty 50 history if we have it
-    const niftyHist = priceHistories['^NSEI'] || priceHistories['NIFTY50'] || 
-                      priceHistories['%5ENSEI'] || [];
-    if (niftyHist.length >= 60) {
-      console.log(`Building regime periods from ${niftyHist.length} days of Nifty 50 history...`);
-      const closes = niftyHist.map(h => h.close);
-      niftyHist.forEach((bar, i) => {
+    // Build regime periods from BOTH indices — Nifty for India, SP500 for US stocks
+    function buildRegime(hist) {
+      const p = {};
+      if (!hist || hist.length < 60) return p;
+      const cls = hist.map(h => h.close);
+      hist.forEach((bar, i) => {
         if (i < 50) return;
-        const ma20  = closes.slice(i-20,i).reduce((s,v)=>s+v,0)/20;
-        const ma50  = closes.slice(i-50,i).reduce((s,v)=>s+v,0)/50;
-        const price = closes[i];
-        let r;
-        if      (price > ma20*1.03 && ma20 > ma50*1.01) r = 'BULL';
-        else if (price > ma20*1.01)                      r = 'SOFT_BULL';
-        else if (price > ma20*0.97)                      r = 'SIDEWAYS';
-        else if (price > ma20*0.94)                      r = 'SOFT_BEAR';
-        else                                             r = 'BEAR';
-        regimePeriods[bar.date] = r;
+        const ma20 = cls.slice(i-20,i).reduce((s,v)=>s+v,0)/20;
+        const ma50 = cls.slice(i-50,i).reduce((s,v)=>s+v,0)/50;
+        const px   = cls[i];
+        p[bar.date] = px>ma20*1.03&&ma20>ma50*1.01?'BULL':px>ma20*1.01?'SOFT_BULL':px>ma20*0.97?'SIDEWAYS':px>ma20*0.94?'SOFT_BEAR':'BEAR';
       });
-      const dist = {};
-      Object.values(regimePeriods).forEach(r => { dist[r] = (dist[r]||0)+1; });
-      console.log(`Regime periods: ${Object.keys(regimePeriods).length} days | ${JSON.stringify(dist)}`);
-    } else {
-      console.log('⚠️ No Nifty 50 history — using default regime periods');
+      return p;
     }
+
+    const niftyHist = priceHistories['^NSEI'] || priceHistories['NIFTY50'] || priceHistories['%5ENSEI'] || [];
+    const spHist    = priceHistories['^GSPC'] || priceHistories['SPY'] || [];
+    const niftyP    = buildRegime(niftyHist);
+    const spP       = buildRegime(spHist);
+
+    // SP500 fills dates Nifty doesn't cover (US market days), Nifty overrides for India dates
+    regimePeriods   = { ...spP, ...niftyP };
+
+    const dist = {};
+    Object.values(regimePeriods).forEach(r => { dist[r] = (dist[r]||0)+1; });
+    console.log(`Regime periods: ${Object.keys(regimePeriods).length} days | ${JSON.stringify(dist)}`);
+    console.log(`  Nifty: ${Object.keys(niftyP).length} | SP500: ${Object.keys(spP).length}`);
   } catch(e) { console.log('Regime periods error:', e.message); }
 
   // ── 11. SCORE WITH 5-LAYER MODEL ─────────────────────────
