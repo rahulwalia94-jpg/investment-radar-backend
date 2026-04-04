@@ -458,6 +458,15 @@ server.listen(PORT, async () => {
 
   // Startup: run morning refresh
   console.log('Startup refresh...');
+  // Warm up FinBERT in background (free tier cold-starts)
+  if (process.env.HF_TOKEN) {
+    const { checkFinBERT } = require('./scoring/newsSignal');
+    console.log('Warming up FinBERT...');
+    checkFinBERT().then(r => {
+      console.log(`FinBERT: ${r.available ? '✅ ready' : '⚠️ ' + r.reason}`);
+    }).catch(() => {});
+  }
+
   runMorningRefresh().catch(e => console.error('Startup error:', e.message));
 
   // Start scheduler

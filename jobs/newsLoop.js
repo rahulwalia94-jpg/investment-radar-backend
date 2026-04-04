@@ -333,9 +333,11 @@ async function saveNewsBatch(results) {
       });
     } else {
       Object.entries(results).forEach(([sym, data]) => {
+        // data can be: array of items OR object with .items property
+        const items = Array.isArray(data) ? data : (data.items || []);
         existing.stocks[sym] = {
-          items:      (data.items || []).slice(0, 10),
-          sentiment:  data.sentiment,
+          items:      items.slice(0, 10),
+          sentiment:  Array.isArray(data) ? 0 : (data.sentiment || 0),
           updated_at: new Date().toISOString(),
         };
       });
