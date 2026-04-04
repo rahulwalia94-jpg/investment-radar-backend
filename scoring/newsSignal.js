@@ -80,9 +80,14 @@ async function finbertBatch(texts) {
   if (!HF_TOKEN || texts.length === 0) return null;
   const all = [];
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch  = texts.slice(i, i + BATCH_SIZE).map(t => t.slice(0, 512));
-    const result = await callFinBERT(batch);
-    if (!result) return null; // if any batch fails, use keyword for all
+    const batch = texts.slice(i, i + BATCH_SIZE).map(t => t.slice(0, 512));
+    // One retry for cold-start
+    let result = await callFinBERT(batch);
+    if (!result) {
+      await new Promise(r => setTimeout(r, 20000)); // wait 20s for warm-up
+      result = await callFinBERT(batch);
+    }
+    if (!result) return null; // still failing — use keyword fallback
     all.push(...result);
   }
   return all;
@@ -113,7 +118,10 @@ async function score(symbol, sector, newsItems) {
 
   const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
   const items  = newsItems
-    .filter(n => !n.published || new Date(n.published).getTime() > cutoff)
+    .filter(n => {
+      const ts = n.published || n.date || n.fetched_at;  // accept any date field
+      return !ts || new Date(ts).getTime() > cutoff;
+    })
     .slice(0, 20);
 
   const texts  = items.map(n => `${n.title||''} ${n.summary||''}`.trim()).filter(Boolean);
@@ -177,9 +185,17 @@ function globalGeoFlags(allItems) {
 // ── STATUS CHECK ──────────────────────────────────────────────
 async function checkFinBERT() {
   if (!HF_TOKEN) return { available:false, reason:'No HF_TOKEN env var' };
-  const result = await finbertBatch(['TCS beats quarterly estimates by 5%']);
-  if (result) return { available:true, model:HF_MODEL, test_score:result[0] };
-  return { available:false, reason:'HF API not responding or model loading' };
+
+  // Try up to 3 times — model cold-starts on free tier (~20s)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const result = await finbertBatch(['TCS beats quarterly estimates by 5%']);
+    if (result) return { available:true, model:HF_MODEL, test_score:result[0], attempts:attempt };
+    if (attempt < 3) {
+      console.log(`FinBERT warming up (attempt ${attempt}/3)... waiting 25s`);
+      await new Promise(r => setTimeout(r, 25000));
+    }
+  }
+  return { available:false, reason:'HF model loading — try again in 1 minute' };
 }
 
 module.exports = { score, globalGeoFlags, checkFinBERT, keywordSentiment };
