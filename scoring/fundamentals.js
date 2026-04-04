@@ -10,7 +10,11 @@ const SECTOR_PE = {
 };
 
 function score(fund, sector, regime) {
-  if (!fund) return { score:50, pe_score:50, roe_score:50, de_score:50, source:'no_data' };
+  // Commodities, bonds, crypto, indices — skip fundamental scoring
+  const skipSectors = ['Commodity','Bond','Crypto','Index','Currency','ETF'];
+  if (!fund || skipSectors.some(s => (sector||'').startsWith(s))) {
+    return { score:50, pe_score:50, roe_score:50, de_score:50, source:'not_applicable' };
+  }
 
   const pe  = fund.pe  || fund.trailingPE || null;
   const roe = fund.roe || null;

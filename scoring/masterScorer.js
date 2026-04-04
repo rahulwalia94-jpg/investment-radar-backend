@@ -16,13 +16,35 @@ const bl       = require('./blOptimizer');
 
 const WEIGHTS = { quant:0.30, news:0.20, fundamental:0.15, macro:0.15, geo:0.10, factor:0.10 };
 
-const BEAR_BOOST  = new Set(['Defence','Pharma','FMCG','Telecom','GLD','TLT','IEF','CEG','NET']);
-const BEAR_SECTOR = { Defence:+10, Pharma:+8, FMCG:+6, Power:+5, Telecom:+4 };
-const BULL_SECTOR = { Banking:+8, Auto:+8, Realty:+6, Metals:+6, NBFC:+5 };
+const BEAR_BOOST  = new Set(['GLD','GC=F','TLT','IEF','SHY','UUP','Defence','Pharma','FMCG','Telecom','CEG']);
+const BEAR_SECTOR = {
+  Defence:+10, Pharma:+8, FMCG:+6, Power:+5, Telecom:+4,
+  Commodity_Gold:+12,    // Gold — #1 BEAR asset
+  Bond_Long:+10,         // Long bonds rally when rates fall
+  Bond_Medium:+8,        // Medium bonds
+  Bond_TIPS:+6,          // Inflation protection
+  Commodity_Silver:+5,   // Silver follows gold
+  Index_Vol:+15,         // VIX spikes in BEAR — track not trade
+  Crypto:-15,            // Crypto crashes in BEAR
+  Commodity_Oil:-5,      // Oil falls in recession
+};
+const BULL_SECTOR = {
+  Banking:+8, Auto:+8, Realty:+6, Metals:+6, NBFC:+5,
+  Crypto:+10,            // Crypto surges in BULL
+  Commodity_Oil:+5,      // Oil rises with growth
+  Bond_Long:-8,          // Bonds fall when rates rise in BULL
+  Commodity_Gold:-3,     // Gold underperforms in BULL
+  ETF_Tech:+8,           // Tech ETFs surge in BULL
+  ETF_Semis:+10,         // Semis are cyclical BULL plays
+};
 
 function regimeAdj(symbol, sector, regime) {
-  if (BEAR_BOOST.has(symbol)) return regime==='BEAR'||regime==='SOFT_BEAR' ? +8 : 0;
-  const map = regime==='BEAR'||regime==='SOFT_BEAR' ? BEAR_SECTOR : regime==='BULL'||regime==='SOFT_BULL' ? BULL_SECTOR : {};
+  if (BEAR_BOOST.has(symbol)) return regime==='BEAR'||regime==='SOFT_BEAR' ? +12 : 0;
+  const isBear = regime==='BEAR'||regime==='SOFT_BEAR';
+  const isBull = regime==='BULL'||regime==='SOFT_BULL';
+  const map    = isBear ? BEAR_SECTOR : isBull ? BULL_SECTOR : {};
+  // Check exact sector match first, then partial
+  if (map[sector]) return map[sector];
   for (const [sec, adj] of Object.entries(map)) {
     if ((sector||'').includes(sec)) return adj;
   }
