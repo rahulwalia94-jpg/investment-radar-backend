@@ -409,6 +409,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── TEST YAHOO FINANCE ───────────────────────────────────
+    // ── FINBERT STATUS ────────────────────────────────────────
+    if (pathname === '/api/test-finbert') {
+      const { checkFinBERT } = require('./scoring/newsSignal');
+      const result = await checkFinBERT();
+      send(res, result);
+      return;
+    }
+
     if (pathname === '/api/test-yahoo') {
       const nse    = require('./scrapers/nse');
       const syms   = ['TCS', 'RELIANCE', 'HDFCBANK', 'NET', 'CEG', '^NSEI'];
