@@ -244,7 +244,7 @@ async function runMorningRefresh() {
   // ── 5. SCORE ALL (batched to stay under 512MB RAM) ──────────
   let scoringResult = null;
   try {
-    const { scoreOne } = require('./scoring/masterScorer');
+    const { scoreOne } = require('../scoring/masterScorer');
     const symList   = Object.keys(instruments);
     const BATCH     = 50;
     const allScores = {};
