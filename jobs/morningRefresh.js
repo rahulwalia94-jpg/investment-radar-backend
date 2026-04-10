@@ -64,11 +64,13 @@ async function runMorningRefresh() {
       nse.getFII().catch(() => null),
     ]);
 
-    // Build prices map from NSE quotes
-    const prices = {};
+    // Build prices map — getBulkQuotes returns {sym: price} directly
+    const prices    = {};
     const rawQuotes = nseQuotes.value || {};
     Object.entries(rawQuotes).forEach(([sym, data]) => {
-      const price = data?.lastPrice || data?.close || data?.ltp || 0;
+      // Handle both formats: direct number or object with price field
+      const price = typeof data === 'number' ? data
+        : data?.lastPrice || data?.close || data?.ltp || data?.price || 0;
       if (price > 0) prices[sym] = parseFloat(price);
     });
     snap.prices = prices;
@@ -152,18 +154,25 @@ async function runMorningRefresh() {
   // ── 3. LOAD FROM B2 ───────────────────────────────────────
   console.log('Loading B2 data...');
 
-  // Price histories
-  let priceHistories = {};
+  // Load index only (not full price data) — saves memory
+  let priceIndex = null;
   try {
-    priceHistories = await fb.getAllPriceHistories() || {};
-    console.log(`  Price histories: ${Object.keys(priceHistories).length} stocks`);
-  } catch(e) { snap.errors.push('prices:' + e.message.slice(0,30)); }
+    priceIndex = await storage.load('price_history_index.json');
+    if (priceIndex?.count) console.log(`  Price history index: ${priceIndex.count} stocks in ${priceIndex.chunks} chunks`);
+  } catch(e) { console.log('  No price history index'); }
 
-  // Correlation matrix
+  // Correlation matrix — load sigmas only if full matrix too large
   let corrMatrixData = null;
   try {
-    corrMatrixData = await storage.load('correlation_matrix.json');
-    if (corrMatrixData?.count) console.log(`  Correlation matrix: ${corrMatrixData.count} stocks`);
+    const corrIdx = await storage.load('correlation_matrix.json');
+    if (corrIdx?.count) {
+      // Only load sigmas and symbols — not the full NxN matrix (too large)
+      corrMatrixData = { symbols: corrIdx.symbols, sigmas: corrIdx.sigmas,
+                         count: corrIdx.count, computed_at: corrIdx.computed_at };
+      // Load corr matrix only if small enough (<200 stocks)
+      if (corrIdx.count <= 200) corrMatrixData.corr = corrIdx.corr;
+      console.log(`  Correlation matrix: ${corrIdx.count} stocks (${corrIdx.count<=200?'full':'sigmas only'})`);
+    }
   } catch(e) { console.log('  No correlation matrix in B2'); }
 
   // Fundamentals
@@ -183,14 +192,41 @@ async function runMorningRefresh() {
   // Instruments
   let instruments = {};
   try {
-    const allInst = await fb.getAllInstruments() || {};
-    instruments   = allInst;
+    instruments = await fb.getAllInstruments() || {};
     console.log(`  Instruments: ${Object.keys(instruments).length}`);
   } catch(e) { snap.errors.push('instruments:' + e.message.slice(0,30)); }
 
   if (Object.keys(instruments).length === 0) {
     console.error('No instruments loaded — aborting');
     return { snap, analysis:null };
+  }
+
+  // Load price histories in chunks — process and discard to save RAM
+  // Build a lazy loader: only loads chunk when needed
+  const priceChunkCache = {};
+  async function getPriceHistory(sym) {
+    if (!priceIndex) return [];
+    // Find which chunk this symbol is in
+    for (let i = 0; i < priceIndex.chunks; i++) {
+      if (!priceChunkCache[i]) {
+        priceChunkCache[i] = await storage.load(`price_history_${i}.json`) || {};
+      }
+      if (priceChunkCache[i][sym]) return priceChunkCache[i][sym];
+    }
+    return [];
+  }
+
+  // Pre-load all chunks but process sequentially
+  console.log('  Loading price histories (chunked)...');
+  const priceHistories = {};
+  if (priceIndex) {
+    for (let i = 0; i < priceIndex.chunks; i++) {
+      const chunk = await storage.load(`price_history_${i}.json`) || {};
+      Object.assign(priceHistories, chunk);
+      // Free memory hint
+      if (global.gc) global.gc();
+    }
+    console.log(`  Price histories loaded: ${Object.keys(priceHistories).length} stocks`);
   }
 
   // ── 4. REGIME PERIODS ─────────────────────────────────────
@@ -205,15 +241,63 @@ async function runMorningRefresh() {
   console.log(`Regime periods: ${Object.keys(regimePeriods).length} | ${JSON.stringify(dist)}`);
   console.log(`  Nifty: ${Object.keys(niftyP).length} | SP500: ${Object.keys(spP).length}`);
 
-  // ── 5. SCORE ALL ──────────────────────────────────────────
+  // ── 5. SCORE ALL (batched to stay under 512MB RAM) ──────────
   let scoringResult = null;
   try {
-    scoringResult = await scoreAll(
-      instruments, snap, newsData,
-      priceHistories, regimePeriods,
-      fundamentalsData, corrMatrixData
-    );
-    snap.success.push(`scored:${Object.keys(scoringResult.scores).length}`);
+    const { scoreOne } = require('./scoring/masterScorer');
+    const symList   = Object.keys(instruments);
+    const BATCH     = 50;
+    const allScores = {};
+    const regime    = snap.regime || 'SIDEWAYS';
+    const mktHist   = priceHistories['^NSEI'] || priceHistories['^GSPC'] || null;
+
+    console.log(`Scoring ${symList.length} instruments in batches of ${BATCH}...`);
+    let done = 0;
+
+    for (let i = 0; i < symList.length; i += BATCH) {
+      const batch = symList.slice(i, i + BATCH);
+      await Promise.all(batch.map(async sym => {
+        const inst    = instruments[sym];
+        const history = priceHistories[sym] || [];
+        try {
+          allScores[sym] = await scoreOne(
+            inst, snap, newsData, history, mktHist,
+            regimePeriods, fundamentalsData
+          );
+        } catch(e) {
+          allScores[sym] = { symbol:sym, score:50, signal:'HOLD',
+            reason:'error', sector:inst.sector||'', country:inst.country||'IN',
+            layers:{}, calibration:{}, last_price:0 };
+        }
+      }));
+      done += batch.length;
+      if (done % 100 === 0) console.log(`  Scored ${done}/${symList.length}`);
+    }
+
+    // Sort
+    const sorted = Object.entries(allScores).sort(([,a],[,b]) => b.score - a.score);
+    const top5   = sorted.slice(0, 5).map(([s]) => s);
+    const top20  = sorted.slice(0, 20).map(([s]) => s);
+
+    // Geo flags
+    const activeFlags = {};
+    Object.values(allScores).forEach(r => {
+      (r.layers?.geo?.flags || []).forEach(f => {
+        if (!activeFlags[f.flag]) activeFlags[f.flag] = { ...f, count:0 };
+        activeFlags[f.flag].count++;
+      });
+    });
+
+    scoringResult = {
+      scores:      allScores,
+      top5, top20,
+      geo_signals: { active_flags: activeFlags },
+      model:       'six-layer-v2',
+      scored_at:   new Date().toISOString(),
+    };
+
+    snap.success.push(`scored:${Object.keys(allScores).length}`);
+    console.log(`Scoring complete. Top 5: ${top5.join(', ')}`);
   } catch(e) {
     console.error('Scoring fatal:', e.message);
     snap.errors.push('scoring:' + e.message.slice(0,40));
