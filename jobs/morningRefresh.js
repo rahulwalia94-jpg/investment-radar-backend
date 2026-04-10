@@ -52,9 +52,92 @@ async function runMorningRefresh() {
   // ── 1. MARKET DATA (prices, FII, indices) ─────────────────
   let snap = { ts: new Date().toISOString(), errors:[], success:[] };
   try {
-    const market = require('../jobs/marketData');
-    Object.assign(snap, await market.fetchAll());
-    console.log(`Prices: NSE=${Object.keys(snap.prices||{}).length} US=${Object.keys(snap.usPrices||{}).length}`);
+    const nse = require('../scrapers/nse');
+
+    // NSE bulk quotes — get all instrument symbols
+    const allSymbols = Object.keys(await fb.getAllInstruments().catch(()=>({})))
+      .filter(s => !s.startsWith('^') && !s.includes('=') && !s.includes('-'));
+    console.log(`Fetching NSE quotes for ${allSymbols.length} symbols...`);
+
+    const [nseQuotes, fiiData] = await Promise.allSettled([
+      nse.getBulkQuotes(allSymbols.slice(0, 500)).catch(() => ({})),
+      nse.getFII().catch(() => null),
+    ]);
+
+    // Build prices map from NSE quotes
+    const prices = {};
+    const rawQuotes = nseQuotes.value || {};
+    Object.entries(rawQuotes).forEach(([sym, data]) => {
+      const price = data?.lastPrice || data?.close || data?.ltp || 0;
+      if (price > 0) prices[sym] = parseFloat(price);
+    });
+    snap.prices = prices;
+
+    // FII data
+    const fiiRaw = fiiData.value;
+    if (fiiRaw) {
+      const today = fiiRaw[Object.keys(fiiRaw)[0]];
+      snap.fii = {
+        fii_net: today?.fii_net || today?.FII_NET || 0,
+        dii_net: today?.dii_net || today?.DII_NET || 0,
+      };
+    } else {
+      snap.fii = { fii_net:0, dii_net:0 };
+    }
+
+    // Indices from prices
+    snap.indices = {
+      nifty:     prices['^NSEI']    || prices['NIFTY50'] || 0,
+      sensex:    prices['^BSESN']   || 0,
+      vix:       prices['^VIX']     || snap.indices?.vix || 18,
+      bankNifty: prices['^NSEBANK'] || 0,
+    };
+
+    // US prices via Yahoo
+    const usPrices = {};
+    const US_SYMS  = ['NET','CEG','GLNG','NVDA','MSFT','AAPL','SPY','QQQ','GLD','TLT',
+                      'CL=F','BZ=F','BTC-USD','^GSPC','^VIX','^TNX'];
+    const https    = require('https');
+
+    await Promise.all(US_SYMS.map(async sym => {
+      try {
+        const toTs   = Math.floor(Date.now()/1000);
+        const fromTs = toTs - 2*24*3600;
+        const price  = await new Promise(resolve => {
+          const req = https.get({
+            hostname: 'query1.finance.yahoo.com',
+            path: `/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&period1=${fromTs}&period2=${toTs}`,
+            headers: { 'User-Agent':'Mozilla/5.0', 'Accept':'application/json' },
+            timeout: 10000,
+          }, res => {
+            const bufs = [];
+            res.on('data', c => bufs.push(c));
+            res.on('end', () => {
+              try {
+                const d = JSON.parse(Buffer.concat(bufs).toString());
+                resolve(d?.chart?.result?.[0]?.meta?.regularMarketPrice || 0);
+              } catch(e) { resolve(0); }
+            });
+          });
+          req.on('error', () => resolve(0));
+          req.on('timeout', () => { req.destroy(); resolve(0); });
+        });
+        if (price > 0) {
+          usPrices[sym] = price;
+          // Also update indices from Yahoo
+          if (sym === '^VIX') snap.indices.vix = price;
+          if (sym === '^GSPC') snap.indices.spx = price;
+          if (sym === 'CL=F') snap.indices.oil = price;
+          if (sym === 'BZ=F') snap.indices.brent = price;
+          if (sym === '^TNX') snap.indices.us10yr = price;
+        }
+      } catch(e) {}
+    }));
+
+    snap.usPrices = usPrices;
+    snap.usdInr   = prices['USDINR=X'] || usPrices['USDINR=X'] || 86;
+
+    console.log(`Prices: NSE=${Object.keys(prices).length} US=${Object.keys(usPrices).length} FII=₹${snap.fii?.fii_net||0}Cr VIX=${snap.indices?.vix}`);
   } catch(e) {
     snap.errors.push('market:' + e.message.slice(0,40));
     console.error('Market data error:', e.message);
